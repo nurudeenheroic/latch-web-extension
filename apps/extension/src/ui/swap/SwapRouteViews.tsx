@@ -9,7 +9,6 @@ import type {
   GetSwapQuoteResponse,
   GetSwapTokenCatalogRequest,
   GetSwapTokenCatalogResponse,
-  RecordKnownSacProbeRequest,
   StoredAccount,
 } from '@latch/types'
 
@@ -17,9 +16,12 @@ import { SwapScreen, swapWalletLabel } from '../screens/SwapScreen'
 import { ConfirmSwapScreen } from '../screens/ConfirmSwapScreen'
 import { SwapFailureScreen } from '../screens/swap/SwapFailureScreen'
 import { SwapSuccessScreen } from '../screens/swap/SwapSuccessScreen'
-import { executeSwapWithSetupLoop } from '../lib/executeSwap'
-import { extractTransactionHash, signAndSubmitBuiltTx } from '../lib/signBuiltTx'
-import { friendlyError, sendToBackground } from '../lib/backgroundClient'
+import { friendlyError, logLatchError, sendToBackground } from '../lib/backgroundClient'
+import {
+  clearPendingWalletOutcome,
+  consumePendingWalletOutcomeIf,
+  writePendingWalletOutcome,
+} from '../../lib/walletOutcome'
 import type { SwapDraft, SwapQuoteVm, SwapTokenVm } from '../swap/swapVm'
 import {
   mergeSwapTokenCatalogs,
@@ -277,7 +279,7 @@ export function SwapRouteViews({
         providerId: swapQuote.quotePayload.providerId,
       },
     })
-    if (!res.ok || !res.data) throw new Error(friendlyError(res.error))
+    if (!res.ok || !res.data) throw new Error(friendlyError(res.error) || 'Swap failed.')
 
     const payUsd = swapTokenPriceUsdBySymbol[payToken.symbol.toUpperCase()]
     const receiveUsd = swapTokenPriceUsdBySymbol[receiveToken.symbol.toUpperCase()]
@@ -286,8 +288,29 @@ export function SwapRouteViews({
     return refreshed
   }
 
+  useEffect(() => {
+    void (async () => {
+      const outcome = await consumePendingWalletOutcomeIf('swap')
+      if (!outcome || outcome.status === 'in_progress') return
+      const payload = outcome.payload ?? {}
+      if (payload.draft) setSwapDraft(payload.draft as SwapDraft)
+      if (payload.quote) setSwapQuote(payload.quote as SwapQuoteVm)
+      setSwapBusy(false)
+      if (outcome.status === 'success') {
+        setSwapStep('success')
+        setSwapFailureDetail(null)
+        void onLoadPortfolio()
+      } else {
+        setSwapStep('failure')
+        setSwapFailureDetail(outcome.error ?? 'Swap failed.')
+      }
+      onSetRoute('swapConfirm')
+    })()
+  }, [onLoadPortfolio, onSetRoute])
+
   async function handleConfirmSwap() {
-    if (!activeAccount?.id || !swapQuote) return
+    if (!activeAccount?.id || !swapQuote || !swapDraft) return
+
     setSwapBusy(true)
     setSwapFailureDetail(null)
     try {
@@ -297,11 +320,41 @@ export function SwapRouteViews({
           ? await refreshSwapQuoteForConfirm()
           : swapQuote
 
-      const prepared = await executeSwapWithSetupLoop({
-        quoteForTx,
-        activeAccount,
-        surface,
+      const outcomePayload = { draft: swapDraft, quote: quoteForTx }
+      if (surface === 'popup') {
+        await writePendingWalletOutcome({
+          kind: 'swap',
+          status: 'in_progress',
+          payload: outcomePayload,
+        })
+      }
+
+      const res = await sendToBackground<
+        {
+          accountId: string
+          quote: typeof quoteForTx.quotePayload
+          surface: Surface
+          outcomePayload?: Record<string, unknown>
+        },
+        {
+          prepared: {
+            estimatedFeeXlm?: string
+            feeLabel?: string
+          }
+          submit: { transactionHash?: string; hash?: string }
+        }
+      >({
+        type: 'EXECUTE_SWAP_CONFIRM',
+        payload: {
+          accountId: activeAccount.id,
+          quote: quoteForTx.quotePayload,
+          surface,
+          outcomePayload,
+        },
       })
+      if (!res.ok) throw new Error(friendlyError(res.error) || 'Swap failed.')
+
+      const prepared = res.data!.prepared
       if (prepared.estimatedFeeXlm || prepared.feeLabel) {
         setSwapQuote((prev) =>
           prev
@@ -315,31 +368,31 @@ export function SwapRouteViews({
         )
       }
 
-      const submitData = await signAndSubmitBuiltTx({
-        build: prepared,
-        activeAccount,
-        surface,
-      })
-      const txHash = extractTransactionHash(submitData)
       setSwapStep('success')
-      const assetOut = quoteForTx.quotePayload.assetOut
-      void sendToBackground<RecordKnownSacProbeRequest, undefined>({
-        type: 'RECORD_KNOWN_SAC_PROBE',
-        payload: {
-          accountId: activeAccount.id,
-          probe: {
-            code: assetOut.symbol,
-            issuer: assetOut.issuer,
-            sacContractId: assetOut.contractId,
-          },
-        },
-      })
+      await clearPendingWalletOutcome()
       void onLoadPortfolio()
+      const submit = res.data!.submit
+      const txHash =
+        typeof submit.transactionHash === 'string'
+          ? submit.transactionHash
+          : typeof submit.hash === 'string'
+            ? submit.hash
+            : undefined
       if (txHash) console.info('[latch:swap] submitted', txHash)
     } catch (e) {
       console.error('[latch:swap]', e)
       setSwapFailureDetail(e instanceof Error ? e.message : String(e))
       setSwapStep('failure')
+      if (surface === 'popup') {
+        await writePendingWalletOutcome({
+          kind: 'swap',
+          status: 'failure',
+          error: e instanceof Error ? e.message : String(e),
+          payload: { draft: swapDraft, quote: swapQuote },
+        }).catch((err) => {
+          logLatchError('swap:pending-outcome', err)
+        })
+      }
     } finally {
       setSwapBusy(false)
     }

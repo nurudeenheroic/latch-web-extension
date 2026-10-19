@@ -12,9 +12,15 @@
 import type {
   Network,
   OpenSignRequestParams,
+  Sep0043GetAddressResponse,
+  Sep0043GetNetworkResponse,
+  Sep0043SignTransactionOptions,
+  Sep0043SignTransactionResponse,
   SignTransactionRequest,
   SignTransactionResponse,
 } from '@latch/types'
+
+import type { LatchPublicMethod } from './publicSurface'
 
 export type LatchAccountChangedPayload = {
   publicKey: string
@@ -27,17 +33,31 @@ export interface LatchSDK {
   /** Returns true if the Latch extension is installed and accessible */
   isConnected(): Promise<boolean>
 
-  /** Request the user's public key — triggers approval UI if not already permitted */
+  /** Request the user's smart-account address as a plain string. */
   getPublicKey(): Promise<string>
 
-  /** Request the user to sign an XDR-encoded transaction */
+  /** Request the user to sign an XDR-encoded transaction. */
   signTransaction(request: SignTransactionRequest): Promise<SignTransactionResponse>
+  signTransaction(
+    xdr: string,
+    opts?: Sep0043SignTransactionOptions
+  ): Promise<Sep0043SignTransactionResponse>
 
   /** Open the extension's review flow for an externally prepared signing request */
   openSignRequest(params: OpenSignRequestParams): Promise<void>
 
   /** Returns the active network */
   getNetwork(): Promise<Network>
+
+  getAddress(): Promise<Sep0043GetAddressResponse>
+  getNetworkDetails(): Promise<Sep0043GetNetworkResponse>
+
+  /**
+   * Revoke Latch access for the current origin. The next `getPublicKey()` /
+   * `getAddress()` prompts the user again. Accounts and other origins are
+   * untouched, and Latch emits no event — clear your own session state.
+   */
+  disconnect(): Promise<void>
 
   /** Subscribe to active account / network changes */
   on?(event: LatchProviderEventName, handler: (payload: LatchAccountChangedPayload) => void): void
@@ -50,9 +70,15 @@ declare global {
     latch?: {
       isConnected(): Promise<boolean>
       getPublicKey(): Promise<string>
-      signTransaction(request: SignTransactionRequest): Promise<SignTransactionResponse>
+      signTransaction(
+        requestOrXdr: SignTransactionRequest | string,
+        opts?: Sep0043SignTransactionOptions
+      ): Promise<SignTransactionResponse | Sep0043SignTransactionResponse>
       openSignRequest(params: OpenSignRequestParams): Promise<void>
       getNetwork(): Promise<Network>
+      getAddress(): Promise<Sep0043GetAddressResponse>
+      getNetworkDetails(): Promise<Sep0043GetNetworkResponse>
+      disconnect?(): Promise<void>
       on?(
         event: LatchProviderEventName,
         handler: (payload: LatchAccountChangedPayload) => void
@@ -63,6 +89,18 @@ declare global {
       ): void
     }
   }
+}
+
+async function signTransaction(request: SignTransactionRequest): Promise<SignTransactionResponse>
+async function signTransaction(
+  xdr: string,
+  opts?: Sep0043SignTransactionOptions
+): Promise<Sep0043SignTransactionResponse>
+async function signTransaction(
+  requestOrXdr: SignTransactionRequest | string,
+  opts?: Sep0043SignTransactionOptions
+): Promise<SignTransactionResponse | Sep0043SignTransactionResponse> {
+  return await requireLatch().signTransaction(requestOrXdr as SignTransactionRequest & string, opts)
 }
 
 function requireLatch(): NonNullable<Window['latch']> {
@@ -80,14 +118,24 @@ export function getLatchSDK(): LatchSDK {
     async getPublicKey() {
       return await requireLatch().getPublicKey()
     },
-    async signTransaction(request: SignTransactionRequest) {
-      return await requireLatch().signTransaction(request)
-    },
+    signTransaction,
     async openSignRequest(params: OpenSignRequestParams) {
       return await requireLatch().openSignRequest(params)
     },
     async getNetwork() {
       return await requireLatch().getNetwork()
+    },
+    async getAddress() {
+      return await requireLatch().getAddress()
+    },
+    async getNetworkDetails() {
+      return await requireLatch().getNetworkDetails()
+    },
+    async disconnect() {
+      const latch = requireLatch()
+      // Older extension builds have no disconnect; treat teardown as a no-op.
+      if (!latch.disconnect) return
+      await latch.disconnect()
     },
     on(event, handler) {
       requireLatch().on?.(event, handler)
@@ -99,3 +147,34 @@ export function getLatchSDK(): LatchSDK {
 }
 
 export default getLatchSDK
+
+/** Compile-time: LatchSDK / Window['latch'] keys must equal LATCH_PUBLIC_METHODS. */
+type ExpectEqual<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false
+
+const _assertPublicSurface: {
+  sdk: ExpectEqual<keyof LatchSDK, LatchPublicMethod>
+  windowLatch: ExpectEqual<keyof NonNullable<Window['latch']>, LatchPublicMethod>
+} = { sdk: true, windowLatch: true }
+void _assertPublicSurface
+
+export { LATCH_PUBLIC_METHODS } from './publicSurface'
+export type { LatchPublicMethod } from './publicSurface'
+
+export {
+  LatchModule,
+  LATCH_MODULE_ICON,
+  LATCH_MODULE_ID,
+  LATCH_MODULE_URL,
+} from './stellar-wallets-kit'
+export type { StellarWalletsKitModule, WalletKitNetworkOptions } from './stellar-wallets-kit'
+
+export type {
+  OpenSignRequestParams,
+  Sep0043GetAddressResponse,
+  Sep0043GetNetworkResponse,
+  Sep0043SignTransactionOptions,
+  Sep0043SignTransactionResponse,
+  Sep0043Error,
+  Sep0043ErrorCode,
+} from '@latch/types'

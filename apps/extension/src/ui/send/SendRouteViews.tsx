@@ -11,10 +11,14 @@ import type {
 
 import { SendFlow } from '../screens/send/SendFlow'
 import { saveToAddressBook } from '../screens/send/useAddressBook'
-import { executeSendWithSetupLoop } from '../lib/executeSend'
 import { createMultisigSendProposalWithSetup } from '../lib/multisigProposal'
 import { enrichSendFailureDetail, buildSendRequestFromDraft } from '../lib/sendTx'
-import { sendToBackground } from '../lib/backgroundClient'
+import { friendlyError, logLatchError, sendToBackground } from '../lib/backgroundClient'
+import {
+  clearPendingWalletOutcome,
+  consumePendingWalletOutcomeIf,
+  writePendingWalletOutcome,
+} from '../../lib/walletOutcome'
 import { INITIAL_SEND_DRAFT, type SendDraft, type SendResult, type SendStep } from '../types/send'
 import type { Route, Surface } from '../routing/routes'
 
@@ -122,10 +126,42 @@ export function SendRouteViews({
       })
       if (buildRes.ok && buildRes.data) return buildRes.data
       return null
-    } catch {
+    } catch (e) {
+      // Fee estimate is best-effort prefetch — confirm still builds the tx.
+      logLatchError('send:fee-estimate', e)
       return null
     }
   }, [activeAccount, sendDraft, sendTokenPriceUsd, activeNetwork])
+
+  useEffect(() => {
+    void (async () => {
+      const outcome = await consumePendingWalletOutcomeIf('send')
+      if (!outcome || outcome.status === 'in_progress') return
+      const payload = outcome.payload ?? {}
+      if (payload.draft) setSendDraft(payload.draft as SendDraft)
+      if (typeof payload.sendTokenPriceUsd === 'number' || payload.sendTokenPriceUsd === null) {
+        setSendTokenPriceUsd(payload.sendTokenPriceUsd as number | null)
+      }
+      setSendProgressLabel(null)
+      if (outcome.status === 'success') {
+        const result = (payload.result as SendResult | undefined) ?? {
+          status: 'success' as const,
+          submittedAt: new Date().toISOString(),
+        }
+        setSendResult(result)
+        setSendStep('success')
+        void onLoadPortfolio()
+      } else {
+        setSendResult({
+          status: 'failure',
+          errorMessage: outcome.error ?? 'Send failed.',
+          submittedAt: new Date().toISOString(),
+        })
+        setSendStep('failure')
+      }
+      onSetRoute('send')
+    })()
+  }, [onLoadPortfolio, onSetRoute])
 
   async function handleSubmitSend() {
     setSendError(null)
@@ -153,21 +189,53 @@ export function SendRouteViews({
       }
 
       if (!activeAccount) throw new Error('No active account')
-      const result = await executeSendWithSetupLoop({
+
+      const outcomePayload = {
         draft: sendDraft,
-        activeAccount,
         sendTokenPriceUsd,
-        activeNetwork,
-        surface,
-        onProgress: setSendProgressLabel,
+      }
+      if (surface === 'popup') {
+        await writePendingWalletOutcome({
+          kind: 'send',
+          status: 'in_progress',
+          payload: outcomePayload,
+        })
+      }
+
+      const res = await sendToBackground<
+        {
+          accountId: string
+          draft: SendDraft
+          sendTokenPriceUsd: number | null
+          network: 'testnet' | 'mainnet'
+          surface: Surface
+          outcomePayload?: Record<string, unknown>
+        },
+        SendResult & { status: 'success' }
+      >({
+        type: 'EXECUTE_SEND_SUBMIT',
+        payload: {
+          accountId: activeAccount.id,
+          draft: sendDraft,
+          sendTokenPriceUsd,
+          network: activeNetwork,
+          surface,
+          outcomePayload,
+        },
       })
+      if (!res.ok) throw new Error(friendlyError(res.error) || 'Send failed.')
+
+      const result = res.data!
       setSendResult(result)
       setSendStep('success')
+      await clearPendingWalletOutcome()
       if (result.status === 'success') {
         void saveToAddressBook({
           address: sendDraft.recipientAddress,
           name: sendDraft.recipientName,
-        }).catch(() => {})
+        }).catch((e) => {
+          logLatchError('send:address-book', e)
+        })
       }
       void onLoadPortfolio()
     } catch (e) {
@@ -184,6 +252,16 @@ export function SendRouteViews({
         submittedAt: new Date().toISOString(),
       })
       setSendStep('failure')
+      if (surface === 'popup') {
+        await writePendingWalletOutcome({
+          kind: 'send',
+          status: 'failure',
+          error: errorMessage,
+          payload: { draft: sendDraft, sendTokenPriceUsd },
+        }).catch((err) => {
+          logLatchError('send:pending-outcome', err)
+        })
+      }
     } finally {
       setSendProgressLabel(null)
     }

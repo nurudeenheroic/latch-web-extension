@@ -12,15 +12,20 @@ import type {
 import { latchFetch } from './client'
 import { unwrapMultisigDraft } from './multisigNormalize'
 import { webauthnBeginBody, webauthnFinishBody } from './webauthn'
+import { withActiveNetwork } from './withActiveNetwork'
 
 export async function createMultisigDraft(): Promise<CreateMultisigDraftResponse> {
-  return await latchFetch<CreateMultisigDraftResponse>('/api/multisig/drafts', { method: 'POST' })
+  return await latchFetch<CreateMultisigDraftResponse>('/api/multisig/drafts', {
+    method: 'POST',
+    body: JSON.stringify(await withActiveNetwork({})),
+  })
 }
 
 export async function getActiveMultisigDraft(): Promise<GetActiveMultisigDraftResponse> {
-  return await latchFetch<GetActiveMultisigDraftResponse>('/api/multisig/drafts?active=1', {
+  const res = await latchFetch<GetActiveMultisigDraftResponse>('/api/multisig/drafts?active=1', {
     method: 'GET',
   })
+  return res
 }
 
 export async function getMultisigDraft(draftId: string): Promise<MultisigDraft> {

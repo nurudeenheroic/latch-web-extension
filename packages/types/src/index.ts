@@ -4,6 +4,63 @@
  * No runtime code — types only.
  */
 
+// ---------------------------------------------------------------------------
+// SEP-0043 types
+// https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0043.md
+// ---------------------------------------------------------------------------
+
+/** Options accepted by the SEP-0043 `signTransaction(xdr, opts?)` method. */
+export interface Sep0043SignTransactionOptions {
+  /** Stellar network passphrase — mapped to Latch `network` (testnet | mainnet). */
+  networkPassphrase?: string
+  /**
+   * Hint to the wallet: which account should sign.
+   * Mapped onto `accountToSign`; should be the active smart-account C… address.
+   */
+  address?: string
+  /** When true the wallet broadcasts the signed tx itself; Latch v1 adapter rejects this. */
+  submit?: boolean
+  /** Custom submit URL (SEP-0043 extension). Not supported in Latch v1. */
+  submitUrl?: string
+}
+
+/** Return value of SEP-0043 `getAddress()`. */
+export interface Sep0043GetAddressResponse {
+  /** The active smart-account address — a Soroban contract address (C…). */
+  address: string
+}
+
+/** Return value of SEP-0043 `signTransaction(xdr, opts?)`. */
+export interface Sep0043SignTransactionResponse {
+  /** Base64-encoded signed transaction XDR. */
+  signedTxXdr: string
+  /** The address that signed the transaction (smart-account C… address). */
+  signerAddress: string
+}
+
+/**
+ * Return value of SEP-0043 `getNetwork()` object shape.
+ * Exposed on `window.latch.getNetworkDetails()` — Latch-native `getNetwork()`
+ * still returns `'testnet' | 'mainnet'`.
+ */
+export interface Sep0043GetNetworkResponse {
+  /** Freighter-compatible network name (e.g. `'TESTNET'` | `'PUBLIC'`). */
+  network: 'TESTNET' | 'PUBLIC'
+  /** Stellar network passphrase. */
+  networkPassphrase: string
+}
+
+/** SEP-0043 error codes per the spec. */
+export type Sep0043ErrorCode = -1 | -2 | -3 | -4
+
+/** Error shape thrown by SEP-0043 adapter methods on `window.latch`. */
+export interface Sep0043Error {
+  message: string
+  code: Sep0043ErrorCode
+  /** Optional extensions (reserved for future use). */
+  ext?: string[]
+}
+
 export type Network = 'testnet' | 'mainnet'
 
 export interface SignTransactionRequest {
@@ -26,7 +83,7 @@ export interface SignTransactionResponse {
   signedXdr?: string
 }
 
-export type AccountMode = 'freighter' | 'phantom' | 'passkey' | 'mnemonic' | 'multisig'
+export type AccountMode = 'passkey' | 'mnemonic' | 'multisig'
 
 export interface StoredAccount {
   id: string
@@ -38,15 +95,8 @@ export interface StoredAccount {
   /** Soroban smart account address */
   smartAccountAddress: string
 
-  /**
-   * Stellar G-address.
-   * - required for Freighter delegated signing
-   * - returned by backend for Phantom smart account
-   */
+  /** Stellar G-address; required for mnemonic delegated signing. */
   gAddress?: string
-
-  /** 32-byte Ed25519 pubkey in hex (no 0x prefix), for Phantom */
-  phantomPublicKeyHex?: string
 
   /** Base64url credential ID, for Passkey/WebAuthn */
   passkeyCredentialId?: string
@@ -70,7 +120,7 @@ export interface StoredAccount {
   cosignWckRefId?: string
   /** Cosign (unwired / not shipped): cached HMAC blind signer id for this member. */
   cosignBlindSignerId?: string
-  /** Cosign (unwired / not shipped): local passkey/freighter account id used to sign. */
+  /** Cosign (unwired / not shipped): local passkey/mnemonic account id used to sign. */
   cosignLinkedAccountId?: string
   /** Factory deploy salt for this multisig wallet. */
   multisigAccountSaltHex?: string
@@ -131,7 +181,12 @@ export interface GetSmartAccountBalancesApiResponse {
   balances: ApiSmartAccountBalance[]
 }
 
-export type SendSignerType = 'passkey' | 'phantom' | 'freighter'
+/**
+ * Backend build/setup contract (`BuildSendTxRequest.signerType`, etc.).
+ * `'freighter'` is the wire value for delegated G-signer builds and is what
+ * mnemonic accounts send; do not rename without a coordinated backend change.
+ */
+export type SendSignerType = 'passkey' | 'freighter'
 
 export interface BuildSendTxRequest {
   smartAccountAddress: string
@@ -141,6 +196,8 @@ export interface BuildSendTxRequest {
   assetId?: string
   contractId?: string
   signerG?: string
+  /** Signing passkey's key data; selects that passkey's context rule on backup-signer accounts. */
+  keyDataHex?: string
   /** Stellar network; omit → API defaults to testnet. */
   network?: Network
 }
@@ -207,6 +264,8 @@ export interface SetupSendRulesResponse extends BuildSendTxResponse {
 
 export interface GetSmartAccountBalancesRequest {
   accountId: string
+  /** Optional per-view id; UI sends CANCEL_REQUEST with the same id to detach the waiter. */
+  requestId?: string
 }
 
 export interface GetSmartAccountBalancesResponse {
@@ -245,6 +304,8 @@ export interface GetSmartAccountTransactionsRequest {
   accountId: string
   /** Bypass fresh TTL and recompute (History pull-to-refresh). */
   force?: boolean
+  /** Optional per-view id; UI sends CANCEL_REQUEST with the same id to detach the waiter. */
+  requestId?: string
 }
 
 export interface GetSmartAccountTransactionsResponse {
@@ -262,6 +323,26 @@ export interface GetAssetIconDataUrlsResponse {
 
 export interface SetActiveAccountRequest {
   accountId: string
+}
+
+export interface DeleteAccountRequest {
+  accountId: string
+}
+
+/**
+ * Removing an account only affects this install: the smart account stays
+ * on-chain and multisig signers are untouched.
+ */
+export interface DeleteAccountResponse {
+  accounts: StoredAccount[]
+  activeAccountId?: string
+  /** True when the list is now empty and the UI should return to onboarding. */
+  removedLastAccount: boolean
+}
+
+/** Optional filter for `GET /api/accounts?credentialId=`. */
+export interface GetBackendAccountsRequest {
+  credentialId?: string
 }
 
 export interface CreateOrConnectFreighterRequest {
@@ -311,18 +392,6 @@ export interface SignDelegatedGAuthEntryRequest {
 export interface SignDelegatedGAuthEntryResponse {
   signedAuthEntryBase64: string
   signerAddress: string
-}
-
-export interface CreateOrConnectPhantomRequest {
-  publicKeyHex: string
-  /** Stellar network; omit → API defaults to testnet. */
-  network?: Network
-}
-
-export interface CreateOrConnectPhantomResponse {
-  smartAccountAddress: string
-  gAddress: string
-  alreadyDeployed: boolean
 }
 
 export interface CreateOrConnectPasskeyRequest {
@@ -393,19 +462,6 @@ export interface BuildDelegatedTxResponse {
   feeLabel?: string
 }
 
-export interface SubmitPhantomTxRequest {
-  txXdr: string
-  authEntryXdr: string
-  authSignatureHex: string
-  prefixedMessage: string
-  publicKeyHex: string
-  contextRuleId: number
-  /** When false, backend signs + assembles but returns `signedTxXdr` without broadcasting. */
-  submit?: boolean
-  /** Stellar network; omit → API defaults to testnet. */
-  network?: Network
-}
-
 export interface SubmitDelegatedTxRequest {
   txXdr: string
   smartAccountAuthEntryXdr: string
@@ -456,10 +512,31 @@ export interface BackendWebauthnBeginResponse {
   options: unknown
 }
 
+/**
+ * Sequence number the next passkey should be named with ("Latch Wallet 3").
+ * Peeked before a registration ceremony, then confirmed once the passkey
+ * exists — see peekNextPasskeySeq / confirmPasskeySeq in the background.
+ */
+export interface PasskeyNextSeqResponse {
+  seq: number
+}
+
+export interface PasskeyConfirmSeqRequest {
+  seq: number
+}
+
 export interface BackendWebauthnRegistrationFinishRequest {
   response: unknown
   /** Stellar network; omit → API defaults to testnet. */
   network?: Network
+  /**
+   * Passkey label this ceremony used (the same string sent on begin) and its
+   * sequence number, for the API to persist into the passkey recovery index so
+   * a fresh device recovers the name too. Optional and ignored by the API until
+   * LATCH_BACKEND_WEBAUTHN_FINISH_LABEL.md ships.
+   */
+  displayName?: string
+  seq?: number
 }
 
 export interface BackendWebauthnRegistrationFinishResponse {
@@ -502,14 +579,28 @@ export type DappPermission = 'getPublicKey' | 'signTransaction'
 
 export type PendingDappRequestKind = DappPermission | 'externalSignReview'
 
+/** Lifecycle of a dApp connect/sign approval (persisted; survives MV3 SW restart). */
+export type DappRequestStatus = 'awaiting_user' | 'signing' | 'approved' | 'rejected' | 'expired'
+
 export interface PendingDappRequest {
   id: string
   origin: string
   kind: PendingDappRequestKind
   createdAt: number
+  /** Defaults to awaiting_user for rows created before status was required. */
+  status?: DappRequestStatus
+  updatedAt?: number
   signRequest?: import('./externalSign').ExternalSignRequest
   prepared?: import('./externalSign').PrepareSignResponse
+  localReview?: import('./externalSign').ExternalSignLocalReview
   source?: import('./externalSign').ExternalSignSource
+  /** Terminal decision fields (set when approved/rejected/expired). */
+  errorMessage?: string
+  errorCode?: string
+  signedXdr?: string
+  txHash?: string
+  signedAuthEntry?: string
+  signedTxXdr?: string
 }
 
 export type ListPendingDappRequestsRequest = Record<string, never>
@@ -530,6 +621,26 @@ export interface ResolvePendingDappRequest {
   signedTxXdr?: string
 }
 
+/** Content-script poll for a previously enqueued connect/sign request. */
+export interface DappPollRequestResultRequest {
+  requestId: string
+  /** Pinned by the CS gate to the attested page origin. */
+  origin?: string
+}
+
+export interface DappPollRequestResultResponse {
+  status: DappRequestStatus
+  publicKey?: string
+  response?: SignTransactionResponse
+  error?: { message: string; code?: string }
+}
+
+/** Enqueue ack when user approval is still required (CS then polls). */
+export interface DappRequestPendingResponse {
+  requestId: string
+  status: 'awaiting_user'
+}
+
 export interface GetDappPermissionsRequest {
   origin: string
 }
@@ -544,18 +655,29 @@ export interface SetDappPermissionsRequest {
   allowed: DappPermission[]
 }
 
-export interface DappGetPublicKeyResponse {
-  publicKey: string
+/** `window.latch.disconnect()` — revokes the origin allowlist entry only. */
+export interface DappDisconnectRequest {
+  origin: string
 }
+
+/**
+ * Content script signals a fresh document for an origin that was previously
+ * disconnected, so Grant Access may prompt again on the next connect call.
+ */
+export interface DappPageSessionStartRequest {
+  origin: string
+}
+
+export type DappGetPublicKeyResponse = { publicKey: string } | DappRequestPendingResponse
 
 export interface DappSignTransactionRequest {
   origin?: string
   request: SignTransactionRequest
 }
 
-export interface DappSignTransactionResponse {
-  response: SignTransactionResponse
-}
+export type DappSignTransactionResponse =
+  | { response: SignTransactionResponse }
+  | DappRequestPendingResponse
 
 export interface SerializableError {
   message: string
@@ -689,30 +811,33 @@ export type MessageType =
   | 'SET_SETUP_STATE'
   | 'GET_ACCOUNTS'
   | 'SET_ACTIVE_ACCOUNT'
-  | 'CREATE_OR_CONNECT_FREIGHTER'
-  | 'CREATE_OR_CONNECT_PHANTOM'
   | 'CREATE_OR_CONNECT_PASSKEY'
   | 'IMPORT_MNEMONIC_ACCOUNT'
   | 'UNLOCK_MNEMONIC_VAULT'
   | 'SIGN_DELEGATED_G_AUTH_ENTRY'
   | 'BUILD_TX'
   | 'BUILD_DELEGATED_TX'
-  | 'SUBMIT_TX_PHANTOM'
   | 'SUBMIT_TX_DELEGATED'
   | 'SUBMIT_TX_WEBAUTHN'
+  | 'PASSKEY_NEXT_SEQ'
+  | 'PASSKEY_CONFIRM_SEQ'
   | 'PASSKEY_REG_BEGIN'
   | 'PASSKEY_REG_FINISH'
   | 'PASSKEY_AUTH_BEGIN'
   | 'PASSKEY_AUTH_FINISH'
   | 'GET_BACKEND_ACCOUNTS'
   | 'RENAME_ACCOUNT'
+  | 'DELETE_ACCOUNT'
   | 'GET_DAPP_PERMISSIONS'
   | 'SET_DAPP_PERMISSIONS'
   | 'LIST_PENDING_DAPP_REQUESTS'
   | 'RESOLVE_PENDING_DAPP_REQUEST'
+  | 'DAPP_POLL_REQUEST_RESULT'
   | 'DAPP_GET_PUBLIC_KEY'
   | 'DAPP_SIGN_TRANSACTION'
   | 'DAPP_OPEN_SIGN_REQUEST'
+  | 'DAPP_DISCONNECT'
+  | 'DAPP_PAGE_SESSION_START'
   | 'MIGRATION_DISCOVER'
   | 'MIGRATION_SWEEP_XLM'
   | 'MIGRATION_SWEEP_TOKEN'
@@ -730,12 +855,26 @@ export type MessageType =
   | 'RUN_EXTERNAL_SIGN_FLOW'
   | 'GET_ACTIVE_NETWORK'
   | 'SET_ACTIVE_NETWORK'
+  | 'GET_DEVELOPER_MODE'
+  | 'SET_DEVELOPER_MODE'
   | 'PING_EXTENSION'
+  | 'CANCEL_REQUEST'
   | 'GET_SWAP_TOKEN_CATALOG'
   | 'GET_SWAP_QUOTE'
   | 'PREPARE_SWAP_TX'
   | 'SETUP_SWAP_RULES'
+  | 'RUN_PASSKEY_BRIDGE'
+  | 'SIGN_PASSKEY_BUILT_TX'
+  | 'EXECUTE_SWAP_CONFIRM'
+  | 'EXECUTE_SEND_SUBMIT'
+  | 'EXECUTE_DAPP_EXTERNAL_SIGN'
+  | 'EXECUTE_MULTISIG_PASSKEY_APPROVE'
   | 'RECORD_KNOWN_SAC_PROBE'
+  | 'LIST_ACCOUNT_SIGNERS'
+  | 'CHECK_SIGNER_PROOF'
+  | 'ATTACH_BACKUP_PASSKEY'
+  | 'EXECUTE_ADD_BACKUP_SIGNER'
+  | 'EXECUTE_REMOVE_ACCOUNT_SIGNER'
   | 'MULTISIG_CREATE_DRAFT'
   | 'MULTISIG_GET_ACTIVE_DRAFT'
   | 'MULTISIG_ADD_DRAFT_MEMBER'
@@ -749,6 +888,7 @@ export type MessageType =
   | 'MULTISIG_DRAFT_PASSKEY_AUTH_FINISH'
   | 'MULTISIG_LIST_ACCOUNTS'
   | 'MULTISIG_REGISTER_ACCOUNT'
+  | 'MULTISIG_ADD_EXISTING_ACCOUNT'
   | 'MULTISIG_JOIN_PREVIEW'
   | 'MULTISIG_JOIN_MEMBER'
   | 'MULTISIG_JOIN_PASSKEY_REG_BEGIN'
@@ -820,36 +960,43 @@ export interface SetSetupStateRequest {
   accountPublicKey?: string
 }
 
+export interface CancelRequest {
+  requestId: string
+}
+
 export type BackgroundRequestPayloadByType = {
   LOGOUT: undefined
   GET_SETUP_STATE: undefined
   SET_SETUP_STATE: SetSetupStateRequest
   GET_ACCOUNTS: undefined
   SET_ACTIVE_ACCOUNT: SetActiveAccountRequest
-  CREATE_OR_CONNECT_FREIGHTER: CreateOrConnectFreighterRequest
-  CREATE_OR_CONNECT_PHANTOM: CreateOrConnectPhantomRequest
   CREATE_OR_CONNECT_PASSKEY: CreateOrConnectPasskeyRequest
   IMPORT_MNEMONIC_ACCOUNT: ImportMnemonicAccountRequest
   UNLOCK_MNEMONIC_VAULT: UnlockMnemonicVaultRequest
   SIGN_DELEGATED_G_AUTH_ENTRY: SignDelegatedGAuthEntryRequest
   BUILD_TX: BuildTxRequest
   BUILD_DELEGATED_TX: BuildDelegatedTxRequest
-  SUBMIT_TX_PHANTOM: SubmitPhantomTxRequest
   SUBMIT_TX_DELEGATED: SubmitDelegatedTxRequest
   SUBMIT_TX_WEBAUTHN: SubmitWebauthnTxRequest
+  PASSKEY_NEXT_SEQ: undefined
+  PASSKEY_CONFIRM_SEQ: PasskeyConfirmSeqRequest
   PASSKEY_REG_BEGIN: { displayName?: string } | undefined
   PASSKEY_REG_FINISH: BackendWebauthnRegistrationFinishRequest
   PASSKEY_AUTH_BEGIN: undefined
   PASSKEY_AUTH_FINISH: BackendWebauthnAuthenticationFinishRequest
-  GET_BACKEND_ACCOUNTS: undefined
+  GET_BACKEND_ACCOUNTS: GetBackendAccountsRequest | undefined
   RENAME_ACCOUNT: { accountId: string; label?: string }
+  DELETE_ACCOUNT: DeleteAccountRequest
   GET_DAPP_PERMISSIONS: GetDappPermissionsRequest
   SET_DAPP_PERMISSIONS: SetDappPermissionsRequest
   LIST_PENDING_DAPP_REQUESTS: ListPendingDappRequestsRequest
   RESOLVE_PENDING_DAPP_REQUEST: ResolvePendingDappRequest
+  DAPP_POLL_REQUEST_RESULT: DappPollRequestResultRequest
   DAPP_GET_PUBLIC_KEY: GetDappPermissionsRequest
   DAPP_SIGN_TRANSACTION: DappSignTransactionRequest
   DAPP_OPEN_SIGN_REQUEST: import('./externalSign').DappOpenSignRequestPayload
+  DAPP_DISCONNECT: DappDisconnectRequest
+  DAPP_PAGE_SESSION_START: DappPageSessionStartRequest
   MIGRATION_DISCOVER: MigrationDiscoverRequest
   MIGRATION_SWEEP_XLM: MigrationSweepXlmRequest
   MIGRATION_SWEEP_TOKEN: MigrationSweepTokenRequest
@@ -867,12 +1014,70 @@ export type BackgroundRequestPayloadByType = {
   RUN_EXTERNAL_SIGN_FLOW: import('./externalSign').RunExternalSignFlowRequest
   GET_ACTIVE_NETWORK: undefined
   SET_ACTIVE_NETWORK: { network: Network }
+  GET_DEVELOPER_MODE: undefined
+  SET_DEVELOPER_MODE: { enabled: boolean }
   PING_EXTENSION: undefined
+  CANCEL_REQUEST: CancelRequest
   GET_SWAP_TOKEN_CATALOG: import('./swap').GetSwapTokenCatalogRequest
   GET_SWAP_QUOTE: import('./swap').GetSwapQuoteRequest
   PREPARE_SWAP_TX: import('./swap').PrepareSwapTxRequest
   SETUP_SWAP_RULES: import('./swap').SetupSwapRulesRequest
+  RUN_PASSKEY_BRIDGE: {
+    mode: 'registration' | 'authentication'
+    optionsJSON: unknown
+    timeoutMs?: number
+  }
+  SIGN_PASSKEY_BUILT_TX: {
+    accountId: string
+    signingAccountId?: string
+    build: BuildSendTxResponse
+    submit?: boolean
+    surface?: 'popup' | 'sidepanel'
+    outcomeKind?: 'swap' | 'send' | 'dapp' | 'multisigApprove' | 'accountSigners'
+  }
+  EXECUTE_SWAP_CONFIRM: {
+    accountId: string
+    quote: import('./swap').SwapQuotePayload
+    surface: 'popup' | 'sidepanel'
+    outcomePayload?: Record<string, unknown>
+  }
+  EXECUTE_SEND_SUBMIT: {
+    accountId: string
+    draft: {
+      token: SmartAccountBalanceRow | null
+      recipientAddress: string
+      recipientName?: string
+      amount: string
+      inputMode: 'crypto' | 'fiat'
+      memo?: string
+    }
+    sendTokenPriceUsd: number | null
+    network: Network
+    surface: 'popup' | 'sidepanel'
+    outcomePayload?: Record<string, unknown>
+  }
+  EXECUTE_DAPP_EXTERNAL_SIGN: {
+    requestId: string
+    accountId: string
+    prepared: BuildSendTxResponse
+    submit: boolean
+    surface: 'popup' | 'sidepanel'
+  }
+  EXECUTE_MULTISIG_PASSKEY_APPROVE: {
+    accountId: string
+    proposalId: string
+    memberId: string
+    authDigestHex: string
+    memberCredentialId?: string
+    surface: 'popup' | 'sidepanel'
+    outcomePayload?: Record<string, unknown>
+  }
   RECORD_KNOWN_SAC_PROBE: RecordKnownSacProbeRequest
+  LIST_ACCOUNT_SIGNERS: import('./accountSigners').ListAccountSignersRequest | undefined
+  CHECK_SIGNER_PROOF: import('./accountSigners').CheckSignerProofRequest | undefined
+  ATTACH_BACKUP_PASSKEY: import('./accountSigners').AttachBackupPasskeyRequest
+  EXECUTE_ADD_BACKUP_SIGNER: import('./accountSigners').ExecuteAddBackupSignerRequest
+  EXECUTE_REMOVE_ACCOUNT_SIGNER: import('./accountSigners').ExecuteRemoveAccountSignerRequest
   MULTISIG_CREATE_DRAFT: undefined
   MULTISIG_GET_ACTIVE_DRAFT: undefined
   MULTISIG_ADD_DRAFT_MEMBER: import('./multisig').MultisigDraftMemberActionRequest
@@ -886,6 +1091,7 @@ export type BackgroundRequestPayloadByType = {
   MULTISIG_DRAFT_PASSKEY_AUTH_FINISH: import('./multisig').MultisigDraftPasskeyRegFinishRequest
   MULTISIG_LIST_ACCOUNTS: undefined
   MULTISIG_REGISTER_ACCOUNT: import('./multisig').RegisterMultisigAccountRequest
+  MULTISIG_ADD_EXISTING_ACCOUNT: import('./multisig').AddExistingMultisigAccountRequest
   MULTISIG_JOIN_PREVIEW: import('./multisig').MultisigJoinTokenRequest
   MULTISIG_JOIN_MEMBER: import('./multisig').MultisigJoinMemberRequest
   MULTISIG_JOIN_PASSKEY_REG_BEGIN: import('./multisig').MultisigJoinPasskeyRegBeginRequest
@@ -970,15 +1176,12 @@ export type BackgroundResponseDataByType = {
   SET_SETUP_STATE: undefined
   GET_ACCOUNTS: GetAccountsResponse
   SET_ACTIVE_ACCOUNT: undefined
-  CREATE_OR_CONNECT_FREIGHTER: CreateOrConnectFreighterResponse & { account: StoredAccount }
-  CREATE_OR_CONNECT_PHANTOM: CreateOrConnectPhantomResponse & { account: StoredAccount }
   CREATE_OR_CONNECT_PASSKEY: CreateOrConnectPasskeyResponse & { account: StoredAccount }
   IMPORT_MNEMONIC_ACCOUNT: ImportMnemonicAccountResponse
   UNLOCK_MNEMONIC_VAULT: undefined
   SIGN_DELEGATED_G_AUTH_ENTRY: SignDelegatedGAuthEntryResponse
   BUILD_TX: BuildTxResponse
   BUILD_DELEGATED_TX: BuildDelegatedTxResponse
-  SUBMIT_TX_PHANTOM: SubmitTxResponse
   SUBMIT_TX_DELEGATED: SubmitTxResponse
   SUBMIT_TX_WEBAUTHN: SubmitTxResponse
   PASSKEY_REG_BEGIN: BackendWebauthnBeginResponse
@@ -991,13 +1194,17 @@ export type BackgroundResponseDataByType = {
   }
   GET_BACKEND_ACCOUNTS: BackendAccountsResponse
   RENAME_ACCOUNT: undefined
+  DELETE_ACCOUNT: DeleteAccountResponse
   GET_DAPP_PERMISSIONS: GetDappPermissionsResponse
   SET_DAPP_PERMISSIONS: GetDappPermissionsResponse
   LIST_PENDING_DAPP_REQUESTS: ListPendingDappRequestsResponse
   RESOLVE_PENDING_DAPP_REQUEST: undefined
+  DAPP_POLL_REQUEST_RESULT: DappPollRequestResultResponse
   DAPP_GET_PUBLIC_KEY: DappGetPublicKeyResponse
   DAPP_SIGN_TRANSACTION: DappSignTransactionResponse
   DAPP_OPEN_SIGN_REQUEST: undefined
+  DAPP_DISCONNECT: undefined
+  DAPP_PAGE_SESSION_START: undefined
   MIGRATION_DISCOVER: MigrationDiscovery
   MIGRATION_SWEEP_XLM: MigrationSweepResult
   MIGRATION_SWEEP_TOKEN: MigrationSweepResult
@@ -1015,12 +1222,38 @@ export type BackgroundResponseDataByType = {
   RUN_EXTERNAL_SIGN_FLOW: import('./externalSign').ExternalSignResult
   GET_ACTIVE_NETWORK: { network: Network; networkLabel: string }
   SET_ACTIVE_NETWORK: { network: Network; networkLabel: string }
+  GET_DEVELOPER_MODE: { enabled: boolean }
+  SET_DEVELOPER_MODE: { enabled: boolean }
   PING_EXTENSION: { connected: true }
+  CANCEL_REQUEST: undefined
   GET_SWAP_TOKEN_CATALOG: import('./swap').GetSwapTokenCatalogResponse
   GET_SWAP_QUOTE: import('./swap').GetSwapQuoteResponse
   PREPARE_SWAP_TX: import('./swap').PrepareSwapTxResponse
   SETUP_SWAP_RULES: import('./swap').SetupSwapRulesResponse
+  RUN_PASSKEY_BRIDGE: unknown
+  SIGN_PASSKEY_BUILT_TX: SubmitTxResponse
+  EXECUTE_SWAP_CONFIRM: {
+    prepared: import('./swap').PrepareSwapTxResponse
+    submit: SubmitTxResponse
+  }
+  EXECUTE_SEND_SUBMIT: {
+    status: 'success'
+    hash?: string
+    submittedAt: string
+  }
+  EXECUTE_DAPP_EXTERNAL_SIGN: {
+    signedTxXdr?: string
+    signedAuthEntry?: string
+    txHash?: string
+    submitData?: SubmitTxResponse
+  }
+  EXECUTE_MULTISIG_PASSKEY_APPROVE: import('./multisig').MultisigProposalDetail
   RECORD_KNOWN_SAC_PROBE: undefined
+  LIST_ACCOUNT_SIGNERS: import('./accountSigners').ListAccountSignersResponse
+  CHECK_SIGNER_PROOF: import('./accountSigners').CheckSignerProofResponse
+  ATTACH_BACKUP_PASSKEY: import('./accountSigners').AttachBackupPasskeyResponse
+  EXECUTE_ADD_BACKUP_SIGNER: import('./accountSigners').ExecuteAddBackupSignerResponse
+  EXECUTE_REMOVE_ACCOUNT_SIGNER: import('./accountSigners').ExecuteRemoveAccountSignerResponse
   MULTISIG_CREATE_DRAFT: import('./multisig').CreateMultisigDraftResponse
   MULTISIG_GET_ACTIVE_DRAFT: import('./multisig').GetActiveMultisigDraftResponse
   MULTISIG_ADD_DRAFT_MEMBER: import('./multisig').MultisigDraft
@@ -1034,6 +1267,7 @@ export type BackgroundResponseDataByType = {
   MULTISIG_DRAFT_PASSKEY_AUTH_FINISH: import('./multisig').MultisigDraftPasskeyRegFinishResponse
   MULTISIG_LIST_ACCOUNTS: import('./multisig').ListMultisigAccountsResponse
   MULTISIG_REGISTER_ACCOUNT: import('./multisig').MultisigAccount
+  MULTISIG_ADD_EXISTING_ACCOUNT: import('./multisig').AddExistingMultisigAccountResponse
   MULTISIG_JOIN_PREVIEW: import('./multisig').MultisigJoinPreviewResponse
   MULTISIG_JOIN_MEMBER: import('./multisig').MultisigDraft
   MULTISIG_JOIN_PASSKEY_REG_BEGIN: BackendWebauthnBeginResponse
@@ -1097,3 +1331,4 @@ export * from './externalSign'
 export * from './swap'
 export * from './multisig'
 export * from './cosign'
+export * from './accountSigners'

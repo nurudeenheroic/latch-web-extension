@@ -6,7 +6,6 @@ import type {
   SetupSendRulesRequest,
   SignDelegatedGAuthEntryRequest,
   SubmitDelegatedTxRequest,
-  SubmitPhantomTxRequest,
   SubmitWebauthnTxRequest,
 } from '@latch/types'
 
@@ -17,13 +16,16 @@ import {
   buildTx,
   setupSendRules,
   submitTxDelegated,
-  submitTxPhantom,
   submitTxWebauthn,
 } from '../backend'
 import { signDelegatedGAddressEntry } from '../delegatedLocalSign'
 import type { OkFn } from '../messageResponse'
 import { getMnemonicKeypair } from '../mnemonicSession'
 import { getActiveNetwork } from '../network/config'
+import {
+  maybeProbeDelegatedEnforcingSim,
+  maybeProbeWebauthnEnforcingSim,
+} from './enforcingSimProbe'
 
 /** Returns true if the message type was handled. */
 export async function tryHandleTxMessage(
@@ -64,15 +66,9 @@ export async function tryHandleTxMessage(
       return true
     }
 
-    case 'SUBMIT_TX_PHANTOM': {
-      const req = message.payload as SubmitPhantomTxRequest
-      const data = await submitTxPhantom(req)
-      sendResponse(ok(data))
-      return true
-    }
-
     case 'SUBMIT_TX_DELEGATED': {
       const req = message.payload as SubmitDelegatedTxRequest
+      maybeProbeDelegatedEnforcingSim(req)
       const data = await submitTxDelegated(req)
       sendResponse(ok(data))
       return true
@@ -80,6 +76,7 @@ export async function tryHandleTxMessage(
 
     case 'SUBMIT_TX_WEBAUTHN': {
       const req = message.payload as SubmitWebauthnTxRequest
+      maybeProbeWebauthnEnforcingSim(req)
       const data = await submitTxWebauthn(req)
       sendResponse(ok(data))
       return true

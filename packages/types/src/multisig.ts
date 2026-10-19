@@ -41,6 +41,8 @@ export interface MultisigDraft {
   smartAccountAddress?: string
   validMemberCount?: number
   canDeploy?: boolean
+  /** Network the draft was created on. Absent rows predate the column and are testnet. */
+  network?: 'testnet' | 'mainnet'
   [key: string]: unknown
 }
 
@@ -106,6 +108,8 @@ export interface MultisigAccount {
   members?: MultisigAccountMember[]
   memberId?: string
   label?: string
+  /** Network the account was deployed on. Absent rows predate the column and are testnet. */
+  network?: 'testnet' | 'mainnet'
   [key: string]: unknown
 }
 
@@ -125,6 +129,19 @@ export interface RegisterMultisigAccountRequest {
     credentialId?: string
     keyDataHex?: string
   }>
+}
+
+export interface AddExistingMultisigAccountRequest {
+  /** Deployed multisig smart account address (C…). */
+  smartAccountAddress: string
+  label?: string
+}
+
+export interface AddExistingMultisigAccountResponse {
+  account: import('./index').StoredAccount
+  activeAccountId?: string
+  /** How membership was proven: backend member row, or on-chain signer read. */
+  verifiedVia: 'backend' | 'onchain'
 }
 
 export interface MultisigJoinPreviewResponse {

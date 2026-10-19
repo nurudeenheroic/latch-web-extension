@@ -3,20 +3,15 @@ import React, { useEffect, useRef, useState } from 'react'
 import type {
   BackendWebauthnAuthenticationFinishResponse,
   BackendWebauthnBeginResponse,
+  BackendWebauthnRegistrationFinishRequest,
   BackendWebauthnRegistrationFinishResponse,
-  CreateOrConnectFreighterRequest,
-  CreateOrConnectFreighterResponse,
-  CreateOrConnectPhantomRequest,
-  CreateOrConnectPhantomResponse,
   ImportMnemonicAccountRequest,
   ImportMnemonicAccountResponse,
   StoredAccount,
   UnlockMnemonicVaultRequest,
 } from '@latch/types'
 
-import { isAllowed, isConnected, setAllowed, getAddress } from '@stellar/freighter-api'
 import { startAuthentication, startRegistration } from '@simplewebauthn/browser'
-import bs58 from 'bs58'
 
 import { ImportSeedScreen } from '../screens/import-seed/ImportSeedScreen'
 import { useSeedPhraseWords } from '../screens/import-seed/useSeedPhraseWords'
@@ -32,28 +27,12 @@ import {
   assertBeginOptionsRpIdMatchesCanonicalDomain,
   assertRegistrationCeremonyForFinish,
   enrichWebauthnRpIdHashErrorMessage,
-  nextPasskeyAccountDisplayName,
-  prepareAuthenticationOptionsForGet,
+  prepareDiscoverableAuthenticationOptions,
   prepareRegistrationOptionsForCreate,
 } from '../webauthn/passkey'
-import { bytesToHex } from '../webauthn/utils'
+import { reservePasskeyName } from '../webauthn/passkeyName'
 import { runWebauthnCredential } from '../webauthn/runWebauthnCredential'
-import { resolveMainRoute, type Route, type SignerId, type Surface } from '../routing/routes'
-
-function readAddressFromFreighterGetAddressResult(v: unknown): string | undefined {
-  if (typeof v === 'string') return v
-  if (typeof v === 'object' && v) {
-    const maybe = v as { address?: unknown }
-    if (typeof maybe.address === 'string') return maybe.address
-  }
-  return undefined
-}
-
-type PhantomSolanaProvider = {
-  connect: () => Promise<{ publicKey?: { toBase58?: () => string } } | undefined>
-  publicKey?: { toBase58?: () => string }
-  signMessage: (msg: Uint8Array) => Promise<{ signature?: Uint8Array } | Uint8Array>
-}
+import { resolveMainRoute, type Route, type Surface } from '../routing/routes'
 
 const ACCOUNT_ROUTES = new Set([
   'addAccount',
@@ -103,12 +82,7 @@ export function AccountRouteViews({
   >
   onPersistSetupHasAccount: (publicKey: string) => Promise<void>
 }) {
-  // Product direction: passkey-only for now. Re-enable when Phantom/Freighter launch is scheduled.
-  // Tracked: https://github.com/3K1-Labs/latch-web-extension/issues/27
-  const ENABLE_OTHER_SIGNERS = false
-
   const [chooseSignerForExistingWallet, setChooseSignerForExistingWallet] = useState(false)
-  const [selectedSigner, setSelectedSigner] = useState<SignerId>('passkey')
   const [importSeedStep, setImportSeedStep] = useState<'phrase' | 'encrypt'>('phrase')
   const [pendingMnemonic, setPendingMnemonic] = useState('')
   const seedWords = useSeedPhraseWords()
@@ -119,7 +93,13 @@ export function AccountRouteViews({
 
   /** Prefetch /begin options so Create / Continue does not await the network before credentials. */
   const passkeyPrefetchRef = useRef<
-    | { kind: 'registration'; optionsJSON: unknown; displayName: string }
+    | {
+        kind: 'registration'
+        optionsJSON: unknown
+        displayName: string
+        seq: number
+        commitSeq: () => Promise<void>
+      }
     | { kind: 'authentication'; optionsJSON: unknown }
     | null
   >(null)
@@ -150,7 +130,10 @@ export function AccountRouteViews({
     void (async () => {
       try {
         if (route === 'createPasskey') {
-          const displayName = nextPasskeyAccountDisplayName(accounts)
+          // This route has no name field, so the passkey is "Latch Wallet N".
+          const reserved = await reservePasskeyName({ fallbackAccounts: accounts })
+          if (cancelled) return
+          const displayName = reserved.displayName
           const begin = await sendToBackground<
             { displayName?: string },
             BackendWebauthnBeginResponse
@@ -165,7 +148,13 @@ export function AccountRouteViews({
             displayName
           )
           assertBeginOptionsRpIdMatchesCanonicalDomain(optionsJSON)
-          passkeyPrefetchRef.current = { kind: 'registration', optionsJSON, displayName }
+          passkeyPrefetchRef.current = {
+            kind: 'registration',
+            optionsJSON,
+            displayName,
+            seq: reserved.seq,
+            commitSeq: reserved.commit,
+          }
         } else {
           const begin = await sendToBackground<undefined, BackendWebauthnBeginResponse>({
             type: 'PASSKEY_AUTH_BEGIN',
@@ -173,7 +162,7 @@ export function AccountRouteViews({
           })
           if (cancelled) return
           if (!begin.ok) throw new Error(friendlyError(begin.error))
-          const optionsJSON = prepareAuthenticationOptionsForGet(begin.data?.options)
+          const optionsJSON = prepareDiscoverableAuthenticationOptions(begin.data?.options)
           assertBeginOptionsRpIdMatchesCanonicalDomain(optionsJSON)
           passkeyPrefetchRef.current = { kind: 'authentication', optionsJSON }
         }
@@ -193,65 +182,6 @@ export function AccountRouteViews({
     // cancel an in-flight ceremony or re-issue /begin while the user is creating.
     // accounts length/contents are handled via route screen.
   }, [route, passkeyPrefetchNonce])
-
-  async function connectFreighter() {
-    onSetError(null)
-    onSetLoading('Connecting to Freighter…')
-    try {
-      const ok = await isConnected()
-      if (!ok) throw new Error('Freighter not detected. Please install the Freighter extension.')
-
-      const allowed = await isAllowed()
-      if (!allowed) await setAllowed()
-
-      const g = (await getAddress()) as unknown
-      const gAddress = readAddressFromFreighterGetAddressResult(g)
-      if (!gAddress) throw new Error('Failed to read Freighter address.')
-      const res = await sendToBackground<
-        CreateOrConnectFreighterRequest,
-        CreateOrConnectFreighterResponse & { account: StoredAccount }
-      >({
-        type: 'CREATE_OR_CONNECT_FREIGHTER',
-        payload: { gAddress },
-      })
-      if (!res.ok) throw new Error(friendlyError(res.error))
-      await onPersistSetupHasAccount(res.data!.smartAccountAddress)
-      await onRefreshAccounts()
-      onSetRoute('home')
-    } finally {
-      onSetLoading(null)
-    }
-  }
-
-  async function connectPhantom() {
-    onSetError(null)
-    onSetLoading('Connecting to Phantom…')
-    try {
-      const provider = (window as unknown as { phantom?: { solana?: PhantomSolanaProvider } })
-        .phantom?.solana
-      if (!provider) throw new Error('Phantom not detected. Please install Phantom.')
-
-      const conn = await provider.connect()
-      const base58Pk = conn?.publicKey?.toBase58?.() ?? provider.publicKey?.toBase58?.()
-      if (!base58Pk) throw new Error('Failed to read Phantom public key.')
-      const pkBytes = bs58.decode(base58Pk)
-      const publicKeyHex = bytesToHex(pkBytes)
-
-      const res = await sendToBackground<
-        CreateOrConnectPhantomRequest,
-        CreateOrConnectPhantomResponse & { account: StoredAccount }
-      >({
-        type: 'CREATE_OR_CONNECT_PHANTOM',
-        payload: { publicKeyHex },
-      })
-      if (!res.ok) throw new Error(friendlyError(res.error))
-      await onPersistSetupHasAccount(res.data!.smartAccountAddress)
-      await onRefreshAccounts()
-      onSetRoute('home')
-    } finally {
-      onSetLoading(null)
-    }
-  }
 
   async function beginMnemonicImport() {
     onSetError(null)
@@ -307,7 +237,6 @@ export function AccountRouteViews({
 
   async function beginPasskeyRegistration() {
     onSetError(null)
-    onSetLoading('Creating passkey…')
     try {
       const pre = passkeyPrefetchRef.current
       if (!pre || pre.kind !== 'registration') {
@@ -320,16 +249,18 @@ export function AccountRouteViews({
       }
       const optionsJSON = pre.optionsJSON
       assertBeginOptionsRpIdMatchesCanonicalDomain(optionsJSON)
+
+      onSetLoading('Creating passkey…')
       const reg = (await webauthnCredential('registration', optionsJSON)) as Awaited<
         ReturnType<typeof startRegistration>
       >
       assertRegistrationCeremonyForFinish(reg)
       const res = await sendToBackground<
-        { response: unknown },
+        BackendWebauthnRegistrationFinishRequest,
         BackendWebauthnRegistrationFinishResponse & { account: StoredAccount }
       >({
         type: 'PASSKEY_REG_FINISH',
-        payload: { response: reg },
+        payload: { response: reg, displayName: pre.displayName, seq: pre.seq },
       })
       if (!res.ok) {
         const errMsg = friendlyError(res.error)
@@ -337,6 +268,8 @@ export function AccountRouteViews({
           await enrichWebauthnRpIdHashErrorMessage(errMsg, { optionsJSON, credentialResponse: reg })
         )
       }
+      // Retire the number only now that the passkey exists.
+      await pre.commitSeq()
       await onPersistSetupHasAccount(res.data!.smartAccountAddress)
       await onRefreshAccounts()
       onSetRoute('passkeyCreated')
@@ -350,7 +283,6 @@ export function AccountRouteViews({
 
   async function loginWithExistingPasskey() {
     onSetError(null)
-    onSetLoading('Logging in with passkey…')
     try {
       const pre = passkeyPrefetchRef.current
       if (!pre || pre.kind !== 'authentication') {
@@ -363,6 +295,8 @@ export function AccountRouteViews({
       }
       const optionsJSON = pre.optionsJSON
       assertBeginOptionsRpIdMatchesCanonicalDomain(optionsJSON)
+
+      onSetLoading('Logging in with passkey…')
       const assertion = (await webauthnCredential('authentication', optionsJSON)) as Awaited<
         ReturnType<typeof startAuthentication>
       >
@@ -436,18 +370,10 @@ export function AccountRouteViews({
         <ChooseSignerScreen
           routeContentMarginClass={routeContentMarginClass}
           flowHeightClass={flowHeightClass}
-          enableOtherSigners={ENABLE_OTHER_SIGNERS}
           chooseSignerForExistingWallet={chooseSignerForExistingWallet}
-          selectedSigner={selectedSigner}
-          onSelectSigner={setSelectedSigner}
           onContinuePasskey={() =>
             onSetRoute(chooseSignerForExistingWallet ? 'addAccountPasskey' : 'createPasskey')
           }
-          onContinueOther={() => {
-            void (selectedSigner === 'freighter' ? connectFreighter() : connectPhantom()).catch(
-              (e) => onSetError(e instanceof Error ? e.message : String(e))
-            )
-          }}
           onGoBack={() => {
             setChooseSignerForExistingWallet(false)
             if (accounts.length > 0) {

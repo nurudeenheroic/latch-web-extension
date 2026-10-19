@@ -17,10 +17,13 @@ export type Route =
   | 'multisigThreshold'
   | 'multisigReviewDeploy'
   | 'multisigSuccess'
+  | 'addExistingMultisig'
   | 'joinMultisig'
   | 'multisigProposals'
   | 'multisigProposalDetail'
   | 'multisigWallets'
+  | 'accountSigners'
+  | 'addBackupPasskey'
   | 'importSeed'
   | 'importSeedEncrypt'
   | 'unlockMnemonic'
@@ -37,8 +40,6 @@ export type Route =
   | 'migration'
   | 'migrationSuccess'
 
-export type SignerId = 'freighter' | 'phantom' | 'passkey'
-
 /**
  * WebAuthn must run in the same document update as the user click as much as possible.
  * The global loading screen replaces route content and unmounts the button; Chrome (esp. side panel) then drops transient activation, so the passkey sheet never appears.
@@ -52,6 +53,8 @@ export function routeKeepsUiMountedForWebauthn(route: Route): boolean {
     route === 'addMultisigOwners' ||
     route === 'joinMultisig' ||
     route === 'multisigProposalDetail' ||
+    route === 'accountSigners' ||
+    route === 'addBackupPasskey' ||
     route === 'fund'
   )
 }
@@ -100,12 +103,16 @@ export function isOnboardingOnlyRoute(route: Route): boolean {
   return ONBOARDING_ONLY_ROUTES.includes(route)
 }
 
+/** Backup passkey signer management for the active passkey wallet. */
+export const SIGNER_ROUTES: Route[] = ['accountSigners', 'addBackupPasskey']
+
 export const MULTISIG_ROUTES: Route[] = [
   'createMultisig',
   'addMultisigOwners',
   'multisigThreshold',
   'multisigReviewDeploy',
   'multisigSuccess',
+  'addExistingMultisig',
   'joinMultisig',
   'multisigProposals',
   'multisigProposalDetail',

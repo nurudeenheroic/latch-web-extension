@@ -2,11 +2,13 @@ import type {
   BackgroundMessage,
   BackendWebauthnAuthenticationFinishRequest,
   BackendWebauthnRegistrationFinishRequest,
-  CreateOrConnectFreighterRequest,
   CreateOrConnectPasskeyRequest,
-  CreateOrConnectPhantomRequest,
+  DeleteAccountRequest,
+  DeleteAccountResponse,
   GetAccountsResponse,
+  GetBackendAccountsRequest,
   ImportMnemonicAccountRequest,
+  PasskeyConfirmSeqRequest,
   SetActiveAccountRequest,
   SetSetupStateRequest,
   UnlockMnemonicVaultRequest,
@@ -15,9 +17,8 @@ import type {
 import { ensureSetupStateMatchesAccounts, getSetupState, setSetupState } from '../actionBehavior'
 import { BackendError } from '../api/client'
 import {
-  createOrConnectFreighter,
+  clearLatchApiSession,
   createOrConnectPasskey,
-  createOrConnectPhantom,
   ensureFreighterSmartAccountDeployed,
   getBackendAccounts,
   passkeyAuthenticationBegin,
@@ -28,6 +29,7 @@ import {
 import { broadcastActiveAccountChanged } from '../dappProviderEvents'
 import type { OkFn } from '../messageResponse'
 import {
+  clearMnemonicSessionKeyForAccount,
   clearMnemonicSessionKeys,
   getMnemonicKeypair,
   registerMnemonicKeypair,
@@ -40,12 +42,33 @@ import {
 } from '../mnemonicVault'
 import { deriveStellarKeypairFromMnemonic } from '../stellarMnemonic'
 import {
+  confirmPasskeySeq,
   createAccount,
-  disconnectSessionForLogoutDev,
+  clearSession,
+  deleteAccount,
   getAccounts,
+  peekNextPasskeySeq,
+  removeRemovedAccountAddress,
   renameAccount,
   setActiveAccount,
 } from '../storage'
+
+/** Best-effort. Never awaited by GET_ACCOUNTS. */
+function repairDisplacedPasskeyAddressesAfterAccountsRead(): void {
+  void (async () => {
+    try {
+      const { repairDisplacedPasskeySmartAccountAddresses } =
+        await import('../api/repairPasskeyAddress')
+      const repaired = await repairDisplacedPasskeySmartAccountAddresses()
+      if (repaired.repairedCount > 0) {
+        const { clearSmartAccountBalancesMemoryCache } = await import('../smartAccountBalances')
+        clearSmartAccountBalancesMemoryCache()
+      }
+    } catch {
+      // best-effort repair only
+    }
+  })()
+}
 
 /** Returns true if the message type was handled. */
 export async function tryHandleAccountsMessage(
@@ -69,27 +92,16 @@ export async function tryHandleAccountsMessage(
 
     case 'LOGOUT': {
       clearMnemonicSessionKeys()
-      await disconnectSessionForLogoutDev()
-      await ensureSetupStateMatchesAccounts()
+      // Wipe local wallets + API sid so the next cold start is a fresh install.
+      // On-chain accounts are untouched; users re-add via passkey login / Add existing.
+      await clearLatchApiSession()
+      await clearSession()
       sendResponse(ok())
       return true
     }
 
     case 'GET_ACCOUNTS': {
       await ensureSetupStateMatchesAccounts()
-      let repairedCount = 0
-      try {
-        const { repairDisplacedPasskeySmartAccountAddresses } =
-          await import('../api/repairPasskeyAddress')
-        const repaired = await repairDisplacedPasskeySmartAccountAddresses()
-        repairedCount = repaired.repairedCount
-        if (repairedCount > 0) {
-          const { clearSmartAccountBalancesMemoryCache } = await import('../smartAccountBalances')
-          clearSmartAccountBalancesMemoryCache()
-        }
-      } catch {
-        // best-effort repair only
-      }
       const data = await getAccounts()
       let activeAccountHasMnemonicVault: boolean | undefined
       let activeAccountMnemonicSignerLoaded: boolean | undefined
@@ -106,7 +118,10 @@ export async function tryHandleAccountsMessage(
         activeAccountHasMnemonicVault,
         activeAccountMnemonicSignerLoaded,
       }
+      // Respond before address repair. Repair writes storage and must not keep
+      // the shell on Loading... or delay the first balance/history request.
       sendResponse(ok(payload))
+      void repairDisplacedPasskeyAddressesAfterAccountsRead()
       return true
     }
 
@@ -116,31 +131,6 @@ export async function tryHandleAccountsMessage(
       // storage.onChanged also broadcasts; await here so dApps update before UI continues
       await broadcastActiveAccountChanged()
       sendResponse(ok())
-      return true
-    }
-
-    case 'CREATE_OR_CONNECT_FREIGHTER': {
-      const req = message.payload as CreateOrConnectFreighterRequest
-      const data = await createOrConnectFreighter(req)
-      const { account } = await createAccount({
-        mode: 'freighter',
-        smartAccountAddress: data.smartAccountAddress,
-        gAddress: req.gAddress,
-      })
-      sendResponse(ok({ ...data, account }))
-      return true
-    }
-
-    case 'CREATE_OR_CONNECT_PHANTOM': {
-      const req = message.payload as CreateOrConnectPhantomRequest
-      const data = await createOrConnectPhantom(req)
-      const { account } = await createAccount({
-        mode: 'phantom',
-        smartAccountAddress: data.smartAccountAddress,
-        gAddress: data.gAddress,
-        phantomPublicKeyHex: req.publicKeyHex,
-      })
-      sendResponse(ok({ ...data, account }))
       return true
     }
 
@@ -188,6 +178,19 @@ export async function tryHandleAccountsMessage(
       return true
     }
 
+    case 'PASSKEY_NEXT_SEQ': {
+      const seq = await peekNextPasskeySeq()
+      sendResponse(ok({ seq }))
+      return true
+    }
+
+    case 'PASSKEY_CONFIRM_SEQ': {
+      const req = message.payload as PasskeyConfirmSeqRequest
+      await confirmPasskeySeq(req.seq)
+      sendResponse(ok())
+      return true
+    }
+
     case 'PASSKEY_REG_BEGIN': {
       const req = (message.payload as { displayName?: string } | undefined) ?? undefined
       const data = await passkeyRegistrationBegin(req)
@@ -222,7 +225,10 @@ export async function tryHandleAccountsMessage(
     }
 
     case 'GET_BACKEND_ACCOUNTS': {
-      const data = await getBackendAccounts()
+      const req = (message.payload ?? {}) as GetBackendAccountsRequest
+      const data = await getBackendAccounts(
+        req.credentialId ? { credentialId: req.credentialId } : undefined
+      )
       sendResponse(ok(data))
       return true
     }
@@ -244,6 +250,9 @@ export async function tryHandleAccountsMessage(
         })
       }
 
+      // Persist only the credential that completed the ceremony. `data.accounts` is
+      // the session's proved set (often just this passkey) and must not replace
+      // the wallets this install already saved.
       const { account, activeAccountId } = await createAccount({
         mode: 'passkey',
         smartAccountAddress: data.smartAccountAddress,
@@ -251,15 +260,7 @@ export async function tryHandleAccountsMessage(
         passkeyKeyDataHex: data.keyDataHex,
       })
 
-      // Best-effort: attach other passkey accounts from session list (may not include keyDataHex).
-      for (const a of data.accounts ?? []) {
-        if (!a.smartAccountAddress || !a.credentialId) continue
-        await createAccount({
-          mode: 'passkey',
-          smartAccountAddress: a.smartAccountAddress,
-          passkeyCredentialId: a.credentialId,
-        })
-      }
+      await removeRemovedAccountAddress(data.smartAccountAddress)
 
       const accRes = await getAccounts()
       sendResponse(ok({ ...data, account, accounts: accRes.accounts, activeAccountId }))
@@ -270,6 +271,22 @@ export async function tryHandleAccountsMessage(
       const req = message.payload as { accountId: string; label?: string }
       await renameAccount(req)
       sendResponse(ok())
+      return true
+    }
+
+    case 'DELETE_ACCOUNT': {
+      const req = message.payload as DeleteAccountRequest
+      const result = await deleteAccount(req.accountId)
+      clearMnemonicSessionKeyForAccount(req.accountId)
+      if (result.removedLastAccount) {
+        // Nothing left to prove who this user is; drop the API session too so a
+        // later hydrate cannot re-import the old session user's wallets.
+        await clearLatchApiSession()
+      }
+      await ensureSetupStateMatchesAccounts()
+      await broadcastActiveAccountChanged()
+      const payload: DeleteAccountResponse = result
+      sendResponse(ok(payload))
       return true
     }
 

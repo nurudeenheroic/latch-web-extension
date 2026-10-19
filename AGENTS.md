@@ -37,7 +37,7 @@ packages/
 - **Do not ship flows that work in one surface but not the other** unless you document an explicit, product-approved exception in this file. Onboarding, passkey create/login, settings, and signing flows must behave the same in popup and side panel.
 - Avoid long `await` chains between a **user click** and **`navigator.credentials`** (WebAuthn): transient user activation is easier to lose in the side panel than in the popup; keep pre-credential work minimal.
 - **Do not swap the whole route for a generic loading screen** between the click and WebAuthn: unmounting the control that received the gesture can prevent the passkey UI from appearing (especially in the side panel). Keep passkey-related screens mounted and use inline disabled/busy state instead (see `routeKeepsUiMountedForWebauthn` in [`routing/routes.ts`](apps/extension/src/ui/routing/routes.ts)).
-- **Side panel WebAuthn**: Chrome often does not complete `navigator.credentials` in the side panel (hangs with no OS prompt). Latch **prefetches** `/begin` on the Create / Passkey-login screens, then runs `startRegistration` / `startAuthentication` in a small **`tabs/passkey-bridge`** extension popup (`chrome.windows` + `chrome.storage.session` handoff) via [`runWebauthnCredential`](apps/extension/src/ui/webauthn/runWebauthnCredential.ts). The action toolbar **popup** keeps in-page WebAuthn. Both surfaces use the same backend finish calls.
+- **WebAuthn / passkey-bridge (popup + side panel)**: Chrome does not reliably complete `navigator.credentials` in the side panel, and the toolbar **action popup** is destroyed when a ceremony window takes focus. Latch **prefetches** `/begin` on Create / Passkey-login screens, then always runs registration/authentication in a small **`tabs/passkey-bridge`** window via [`runWebauthnCredential`](apps/extension/src/ui/webauthn/runWebauthnCredential.ts) → background **`RUN_PASSKEY_BRIDGE`**. Confirm flows (swap/send/dapp/multisig approve) run as background jobs (`EXECUTE_*` / `SIGN_PASSKEY_BUILT_TX`) so setup loops survive popup death; outcomes restore via `latch.pendingWalletOutcome` + `chrome.action.openPopup()` (only when no toolbar popup is open). **Never open a separate window or tab to show a result** — if `openPopup` is refused, the outcome waits in session storage and the next popup open lands on it. The bridge window is ceremony-only and the background closes it when the ceremony settles. Loading / success / failure / Back Home stay in the normal wallet UI — never the bridge. Onboarding full-tab may still use in-page WebAuthn. Both surfaces use the same backend finish calls.
 
 ## Tech Stack
 
@@ -52,6 +52,7 @@ packages/
 - All inter-context communication via `chrome.runtime.sendMessage`
 - Message types defined in `@latch/types` (`MessageType`, `BackgroundMessage`, `BackgroundResponse`)
 - Network config via `PLASMO_PUBLIC_*` env vars. Outbound HTTP lives in [`apps/extension/src/background/api/*`](apps/extension/src/background/api/); [`backend.ts`](apps/extension/src/background/backend.ts) re-exports the public API. **`PLASMO_PUBLIC_LATCH_API_URL`** defaults to `https://latch-backend.onrender.com` (Render Go backend). **`PLASMO_PUBLIC_LATCH_MARKET_API_URL`** defaults to `{LATCH_API_URL}/v1` when unset. Local dev: set to `http://localhost:3000` and ensure `apps/extension/package.json` `manifest.host_permissions` includes that origin.
+- **Never copy `apps/extension/.env.example` over `apps/extension/.env`.** `.env` is local-only and gitignored; overwriting it destroys developer-specific values. Edit `.env` **manually** when a var must change. CI may still seed from `.env.example` in a clean checkout — that does not authorize agents to clobber an existing local `.env`.
 - Stellar network: testnet by default during development
 - All icons SVGs should never be written from scratch, prefer importing icons that fit the task.
 - Use lucide icons or icon svgs if provided
@@ -85,8 +86,13 @@ packages/
   - define message payloads + responses in `@latch/types`
   - keep background handlers narrow and explicit per `MessageType`
 - **Make requests cancellable**:
-  - popup should send a request id (or use per-view lifecycle)
-  - background should support cancellation via `AbortController` when a view unmounts or a request is superseded
+  - popup/side panel sends an optional `requestId` on long reads (balances, history, swap quote)
+  - UI calls `CANCEL_REQUEST` with the same id on unmount, account switch, or superseded fetch
+  - background registers an `AbortController` per `requestId` and races the **waiter** (not shared inflight I/O) — always `sendResponse({ ok: false, error: { code: 'cancelled' } })` on cancel; never swallow abort without responding
+  - **Do not abort shared inflight** Horizon/RPC or quote-cache promises other waiters still need; cancel detaches only the message waiter
+  - v1: swap quote provider HTTP is not aborted on cancel (waiter-only); document if extending
+  - never cancel WebAuthn / signing mid-ceremony
+  - handler template: `withCancellableWaiter(req.requestId, () => runGet…())` in reads/swap handlers; see `requestRegistry.ts` + `requestWaiter.ts`
 - **De-dupe in-flight requests**:
   - if multiple UI renders ask for the same resource, background should reuse the same promise keyed by (endpoint, params, network)
 - **Cache where it matters**:
@@ -106,6 +112,16 @@ packages/
 - Don’t scatter ad-hoc `fetch()` calls across UI components; route them through background handlers.
 - Don’t store secrets/tokens in `chrome.storage` from the UI; secrets live only in the vault and are accessed only in background.
 
+### Mainnet data plane (agreed direction)
+
+The target is that clients talk only to latch-api for chain data. Today the background still calls RPC directly (balances, history, swaps, multisig signer reads, simulation) and Horizon (trustlines, G-address existence). Those reads move server-side as the items below land. Don't add new direct chain reads that this list moves server-side.
+
+- **RPC:** the paid mainnet provider lives on latch-api and latch-relayer only. Never put a provider key in `PLASMO_PUBLIC_*`: anything in a client build is public. The extension stays on the public endpoint until its reads move server-side. Compare providers with `node scripts/rpc-probe.mjs <url>`.
+- **Prices:** key every price by **contract ID** (XLM = native SAC ID, classic assets = their SAC ID, SEP-41 = the contract). Never look up or compute USD by token code: a spoofed `USDC` would get the real price. Unpriced and hidden tokens never count toward the total.
+- **History and token list:** come from a latch-api event worker that stores `transfer` / `mint` / `burn` / `clawback` events for registered wallets. Client-side history from Horizon + `getEvents` is retired once that route exists for the cookie-session API. Tokens nobody curated, added or sent go under "Hidden tokens".
+- **Submission:** latch-api validates and simulates; latch-relayer's gasless service submits through channel accounts with a fee-bump funder. The user pays the fee through FeeForwarder in XLM, or in USDC if they hold no XLM; Latch sponsors only a new wallet's setup transactions (deployment, setup-send-rules, setup-swap-rules), capped per wallet. Any other transaction from a wallet with neither XLM nor USDC is refused with "add XLM or USDC to pay network fees". Every wallet transaction is wrapped in `forward()`, so dApp/send/swap review must show the inner call and the maximum fee. "Send max" must leave room for the fee.
+- **Horizon** stays only for linked G-address trustlines and the on-ramp pool.
+
 ## Refined UI + UX Patterns (extension surfaces)
 
 ### Onboarding flow (popup and side panel)
@@ -119,24 +135,45 @@ State is stored in `chrome.storage.local` (no secrets):
 
 Render onboarding until `setupState === "has_account"`, then the dashboard/home UI.
 
+### Account list identity (do not widen)
+
+The Latch API identifies callers by an anonymous **`sid` cookie** that survives reinstalls and mints a new user when absent, so "what the API returns for this cookie" is **not** "what belongs to this user". The account list must be scoped to signers this install has actually proved. Full analysis and the backend fix: [`LATCH_BACKEND_ACCOUNT_IDENTITY.md`](LATCH_BACKEND_ACCOUNT_IDENTITY.md).
+
+Rules to preserve:
+
+- **`PASSKEY_AUTH_FINISH` persists only the credential that completed the ceremony.** Never replace the local account list with `data.accounts` or `GET /api/accounts`. That response is the passkeys this session has proved, which is often only the one that just signed in. Other wallets saved on this install stay in local storage.
+- **Multisig sync requires a local signer.** `syncLocalMultisigAccountsFromBackend` imports a listed wallet only when a member matches a local passkey/seed (`remoteMultisigMatchesLocalSigner`); creator-only rows are skipped. With no local signer it imports nothing.
+- **Empty account store clears `sid`** (fresh install or last account removed). Use `clearLatchApiSession()`.
+- **`LOGOUT` is a full local wipe:** `clearLatchApiSession()` plus `clearSession()` (all networks' accounts, vaults, setup, denylist). On-chain wallets are untouched. UI confirms, then returns to onboarding.
+- **Removal is local only.** `DELETE_ACCOUNT` drops the `StoredAccount` and records the address in the per-network denylist (`latch.removedAccounts.byNetwork`) so sync cannot resurrect it. It never leaves the on-chain wallet or removes a multisig signer. An explicit re-add clears the denylist entry. The UI applies the delete response accounts list immediately so View Accounts updates without waiting on a follow-up GET.
+
 ### WebAuthn / passkey (Chrome extension)
 
 Passkeys use a **shared HTTPS-domain RP ID** so the same credential can work in the Chrome extension, a future Latch website, and associated native apps.
 
-- **RP ID:** `PLASMO_PUBLIC_WEBAUTHN_RP_ID` (default `latch-testing.vercel.app`). Hostname only — never `chrome.runtime.id`.
-- **Origins:** ceremonies from the extension produce `clientDataJSON.origin = chrome-extension://<chrome.runtime.id>`. Web ceremonies use `https://latch-testing.vercel.app`. The Latch API must allowlist both as `expectedOrigins` while always verifying `expectedRPID` = the domain.
+- **RP ID:** `PLASMO_PUBLIC_WEBAUTHN_RP_ID` (default `uselatch.app`). Hostname only — never `chrome.runtime.id`.
+- **Origins:** ceremonies from the extension produce `clientDataJSON.origin = chrome-extension://<chrome.runtime.id>`. Web ceremonies use `https://uselatch.app`. The Latch API must allowlist both as `expectedOrigins` while always verifying `expectedRPID` = the domain.
 - The background still sends **`chromeExtensionId`** (`chrome.runtime.id`) on WebAuthn-related API calls as an **origin hint only** — not as `rp.id`.
 
 **Contract for the Latch API** (registration begin/finish, authentication begin/finish, and any route that verifies WebAuthn assertions):
 
-- Always set **`rp.id` / `rpId`** = `WEBAUTHN_RP_ID` (`latch-testing.vercel.app`), for both web and extension clients.
+- Always set **`rp.id` / `rpId`** = `WEBAUTHN_RP_ID` (`uselatch.app`), for both web and extension clients.
 - When `chromeExtensionId` is present, include **`chrome-extension://<chromeExtensionId>`** in **`expectedOrigins`** (do **not** set `expectedRPID` to the extension id).
-- Also allow `https://latch-testing.vercel.app` in `expectedOrigins`.
+- Also allow `https://uselatch.app` in `expectedOrigins`.
 - Prefer the finish-body `chromeExtensionId` if session storage is unreliable.
 
 Full backend cutover guide: [`LATCH_BACKEND_DOMAIN_WEBAUTHN_RPID.md`](LATCH_BACKEND_DOMAIN_WEBAUTHN_RPID.md).
 
-The extension merges **`chromeExtensionId`** into begin, registration finish, authentication finish, and **`submitTxWebauthn`** request bodies from [`api/webauthn.ts`](apps/extension/src/background/api/webauthn.ts) and [`api/transactions.ts`](apps/extension/src/background/api/transactions.ts). The UI asserts server-issued **`rp.id` / `rpId`** matches **`latchWebauthnRpId()`** before calling `startRegistration` / `startAuthentication` (see [`passkey.ts`](apps/extension/src/ui/webauthn/passkey.ts) → `assertBeginOptionsRpIdMatchesCanonicalDomain`). Extension manifest must include host permission `https://latch-testing.vercel.app/*` so Chrome can claim that RP ID from extension pages.
+The extension merges **`chromeExtensionId`** into begin, registration finish, authentication finish, and **`submitTxWebauthn`** request bodies from [`api/webauthn.ts`](apps/extension/src/background/api/webauthn.ts) and [`api/transactions.ts`](apps/extension/src/background/api/transactions.ts). The UI asserts server-issued **`rp.id` / `rpId`** matches **`latchWebauthnRpId()`** before calling `startRegistration` / `startAuthentication` (see [`passkey.ts`](apps/extension/src/ui/webauthn/passkey.ts) → `assertBeginOptionsRpIdMatchesCanonicalDomain`). Extension manifest must include host permission `https://uselatch.app/*` so Chrome can claim that RP ID from extension pages.
+
+### dApp external-sign review (hybrid)
+
+dApp `signTransaction` / sign-request review uses **wallet-side XDR decode** for what the user sees (`parseTxForReview` / `assessExternalSignReview` in `@latch/stellar`). The review list must not trust `prepare-sign` `operations[]` (often empty on the Go API).
+
+- **`prepare-sign` remains mandatory** for auth templates, digests, and signing. Confirm still consumes `prepared` via `signAndSubmitBuiltTx` / `signWithoutSubmitBuiltTx`.
+- **Consistency checks** (network, active smart account `C…`, invoke contract id sets from unsigned XDR vs `prepared.txXdr`) hard-block Confirm when they disagree. Compare contract ids — not raw XDR string equality.
+- **Fail closed** if Latch API / `prepare-sign` is down: no review and no “review anyway” path. Client-side simulate is out of scope.
+- Popup, side panel, and `tabs/sign-request.tsx` all render the same `localReview` payload from `prepareExternalSignSession`.
 
 ### Multisig wallets (`/api/multisig` — shipped)
 
@@ -144,7 +181,8 @@ The extension merges **`chromeExtensionId`** into begin, registration finish, au
 
 - Deployed multisig wallets are **`StoredAccount`** entries with **`mode: 'multisig'`**. They reuse **`GET_SMART_ACCOUNT_BALANCES`**, history, and account switching like passkey wallets.
 - **Session fields on `StoredAccount`**: `multisigMemberId`, `multisigBackendAccountId`, `multisigThreshold` (required for approve/execute). Optional cosign fields (`cosignWckRefId`, etc.) may exist on disk but are **not used** by the live path.
-- **Routes** (popup + side panel): `createMultisig`, `addMultisigOwners`, `multisigThreshold`, `multisigReviewDeploy`, `multisigSuccess`, `joinMultisig`, `multisigWallets`, `multisigProposals`, `multisigProposalDetail`.
+- **Routes** (popup + side panel): `createMultisig`, `addMultisigOwners`, `multisigThreshold`, `multisigReviewDeploy`, `multisigSuccess`, `addExistingMultisig`, `joinMultisig`, `multisigWallets`, `multisigProposals`, `multisigProposalDetail`.
+- **Add existing wallet**: Settings → View Accounts → Add → **Add existing MultiSig** routes to `addExistingMultisig`. **`MULTISIG_ADD_EXISTING_ACCOUNT`** proves membership in the background (backend member row matching a local signer, else a read-only on-chain read of the Default context rule in [`onchainSigners.ts`](apps/extension/src/background/multisig/onchainSigners.ts)) and **fails closed** for non-signers. UI never touches RPC.
 - **Create flow**: `MULTISIG_CREATE_DRAFT` → co-owners (**Add my passkey**, paste `G…`, or invite link `?multisigJoin=` / legacy `?cosignJoin=`) → threshold → predict → **`POST /api/multisig/drafts/{id}/deploy`** → local account + `MULTISIG_LIST_ACCOUNTS` sync.
 - **Join flow**: deep link or Settings → Multisig Wallets; [`MultisigJoinFlow`](apps/extension/src/ui/multisig/MultisigJoinFlow.tsx) uses **`MULTISIG_JOIN_*`**, then pending invite + sync so members get `smartAccountAddress` + `multisigMemberId`.
 - **Send**: when the active account is multisig, Send creates a backend proposal via `createMultisigSendProposalWithSetup` (`MULTISIG_CREATE_PROPOSAL`). **Swap is disabled** for multisig accounts.
@@ -238,9 +276,19 @@ pnpm test        # run all tests
 pnpm format      # prettier across repo
 ```
 
+### Screen tests
+
+For a lightweight UI smoke test (props-only, no LatchRoot):
+
+1. Put `// @vitest-environment jsdom` at the top of the `*.test.tsx` file (default Vitest env stays `node`).
+2. Render a screen that already takes props — see [`HistoryScreen.test.tsx`](apps/extension/src/ui/screens/history/HistoryScreen.test.tsx).
+3. Pass data in; do not fetch, sign, or mount `LatchRoot`.
+4. Run `pnpm --filter @latch/extension test`.
+
 ## What NOT to do
 
 - Do not add MetaMask-style middleware stacks — not needed for Stellar
 - Do not sign transactions in the popup or content script
 - Do not store raw private keys in chrome.storage — vault must be encrypted
 - Do not add Redux — use context or Zustand at the right scope
+- Do not run `cp apps/extension/.env.example apps/extension/.env` (or equivalent) when a local `.env` already exists — update `.env` by hand instead

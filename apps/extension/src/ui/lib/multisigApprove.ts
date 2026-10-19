@@ -1,43 +1,16 @@
 import type {
   MultisigAccountMember,
   MultisigApproveDelegatedFinishRequest,
-  MultisigApproveWebauthnRequest,
   MultisigProposalDetail,
   SignDelegatedGAuthEntryRequest,
   SignDelegatedGAuthEntryResponse,
   StoredAccount,
 } from '@latch/types'
 
-import { signAuthEntry } from '@stellar/freighter-api'
-import { startAuthentication } from '@simplewebauthn/browser'
-
-import { normalizeDelegatedSignatureBase64 } from '../../lib/delegatedAuthSubmit'
 import { fetchActiveNetwork, networkPassphraseFor } from './activeNetwork'
 import { friendlyError, sendToBackground } from './backgroundClient'
-import {
-  assertPasskeyAssertionMatchesAuthDigest,
-  buildPasskeySigDataXdrFromAssertion,
-  passkeyAuthenticationOptionsForAuthDigest,
-  prepareAuthenticationOptionsForGet,
-} from '../webauthn/passkey'
-import { openPasskeyBridgeAndWait } from '../webauthn/passkeyBridge'
 
 export type MultisigApprovalSignerKind = 'passkey' | 'delegated'
-
-async function runPasskeyAuth(
-  surface: 'popup' | 'sidepanel',
-  optionsJSON: unknown
-): Promise<Awaited<ReturnType<typeof startAuthentication>>> {
-  if (surface === 'sidepanel') {
-    return (await openPasskeyBridgeAndWait({
-      mode: 'authentication',
-      optionsJSON,
-    })) as Awaited<ReturnType<typeof startAuthentication>>
-  }
-  return await startAuthentication({
-    optionsJSON: prepareAuthenticationOptionsForGet(optionsJSON),
-  } as Parameters<typeof startAuthentication>[0])
-}
 
 export function findProposalMember(
   proposal: MultisigProposalDetail,
@@ -70,7 +43,7 @@ export function findDelegatedSigningAccount(
 ): StoredAccount | undefined {
   const expected = gAddress?.trim()
   return accounts.find((account) => {
-    if (account.mode !== 'freighter' && account.mode !== 'mnemonic') return false
+    if (account.mode !== 'mnemonic') return false
     const g = account.gAddress?.trim()
     if (!g) return false
     return !expected || g === expected
@@ -131,7 +104,7 @@ export function peekMultisigApprovalSigner(args: {
     const resolved = resolveMultisigApprovalSigner(args)
     return {
       kind: resolved.kind,
-      approveLabel: multisigApprovalButtonLabel(resolved.kind, resolved.signingAccount),
+      approveLabel: multisigApprovalButtonLabel(resolved.kind),
       busyLabel: multisigApprovalBusyLabel(resolved.kind),
     }
   } catch {
@@ -139,12 +112,8 @@ export function peekMultisigApprovalSigner(args: {
   }
 }
 
-export function multisigApprovalButtonLabel(
-  kind: MultisigApprovalSignerKind,
-  signingAccount?: StoredAccount
-): string {
+export function multisigApprovalButtonLabel(kind: MultisigApprovalSignerKind): string {
   if (kind === 'delegated') {
-    if (signingAccount?.mode === 'freighter') return 'Approve with Freighter'
     return 'Approve with wallet'
   }
   return 'Approve with passkey'
@@ -252,24 +221,48 @@ export async function approveMultisigProposalWithPasskey(args: {
     throw new Error('No passkey is available to approve this proposal.')
   }
 
-  const optionsJSON = passkeyAuthenticationOptionsForAuthDigest({
+  const assertion = await runPasskeyBridgeViaBackground({
+    proposalId: proposal.id,
+    memberId,
     authDigestHex,
-    credentialId,
+    accountId: activeAccount.id,
+    memberCredentialId: member?.credentialId,
+    surface,
   })
+  return assertion
+}
 
-  const assertion = await runPasskeyAuth(surface, optionsJSON)
-  assertPasskeyAssertionMatchesAuthDigest(assertion, authDigestHex)
-  const sigDataXdrHex = buildPasskeySigDataXdrFromAssertion(assertion)
-
-  const res = await sendToBackground<MultisigApproveWebauthnRequest, MultisigProposalDetail>({
-    type: 'MULTISIG_APPROVE_WEBAUTHN',
+async function runPasskeyBridgeViaBackground(args: {
+  proposalId: string
+  memberId: string
+  authDigestHex: string
+  accountId: string
+  memberCredentialId?: string
+  surface: 'popup' | 'sidepanel'
+}): Promise<MultisigProposalDetail> {
+  const res = await sendToBackground<
+    {
+      accountId: string
+      proposalId: string
+      memberId: string
+      authDigestHex: string
+      memberCredentialId?: string
+      surface: 'popup' | 'sidepanel'
+      outcomePayload?: Record<string, unknown>
+    },
+    MultisigProposalDetail
+  >({
+    type: 'EXECUTE_MULTISIG_PASSKEY_APPROVE',
     payload: {
-      proposalId: proposal.id,
-      memberId,
-      sigDataXdrHex,
+      accountId: args.accountId,
+      proposalId: args.proposalId,
+      memberId: args.memberId,
+      authDigestHex: args.authDigestHex,
+      memberCredentialId: args.memberCredentialId,
+      surface: args.surface,
+      outcomePayload: { proposalId: args.proposalId },
     },
   })
-
   if (!res.ok) throw new Error(friendlyError(res.error))
   return res.data!
 }
@@ -308,41 +301,23 @@ export async function approveMultisigProposalWithDelegated(args: {
   })
   if (!beginRes.ok || !beginRes.data) throw new Error(friendlyError(beginRes.error))
 
-  const { templateXdr, signerAddress: beginSignerAddress } = parseDelegatedBeginTemplate(
-    beginRes.data
-  )
+  const { templateXdr } = parseDelegatedBeginTemplate(beginRes.data)
   const networkPassphrase = networkPassphraseFor((await fetchActiveNetwork()).network)
 
-  let signedAuthEntryBase64: string
-  let signerAddress: string
-
-  if (signingAccount.mode === 'freighter') {
-    const gAddress = signingAccount.gAddress?.trim()
-    if (!gAddress) throw new Error('Missing G-address for Freighter account')
-    const signed = await signAuthEntry(templateXdr, {
+  const signRes = await sendToBackground<
+    SignDelegatedGAuthEntryRequest,
+    SignDelegatedGAuthEntryResponse
+  >({
+    type: 'SIGN_DELEGATED_G_AUTH_ENTRY',
+    payload: {
+      accountId: signingAccount.id,
+      gAddressEntryTemplateXdr: templateXdr,
       networkPassphrase,
-      address: gAddress,
-    })
-    if (signed.error) throw new Error(signed.error.message ?? 'Freighter signing failed')
-    if (!signed.signedAuthEntry) throw new Error('Freighter signing failed')
-    signedAuthEntryBase64 = normalizeDelegatedSignatureBase64(signed.signedAuthEntry)
-    signerAddress = signed.signerAddress ?? beginSignerAddress ?? gAddress
-  } else {
-    const signRes = await sendToBackground<
-      SignDelegatedGAuthEntryRequest,
-      SignDelegatedGAuthEntryResponse
-    >({
-      type: 'SIGN_DELEGATED_G_AUTH_ENTRY',
-      payload: {
-        accountId: signingAccount.id,
-        gAddressEntryTemplateXdr: templateXdr,
-        networkPassphrase,
-      },
-    })
-    if (!signRes.ok || !signRes.data) throw new Error(friendlyError(signRes.error))
-    signedAuthEntryBase64 = signRes.data.signedAuthEntryBase64
-    signerAddress = signRes.data.signerAddress
-  }
+    },
+  })
+  if (!signRes.ok || !signRes.data) throw new Error(friendlyError(signRes.error))
+  const signedAuthEntryBase64 = signRes.data.signedAuthEntryBase64
+  const signerAddress = signRes.data.signerAddress
 
   const finishRes = await sendToBackground<
     MultisigApproveDelegatedFinishRequest,

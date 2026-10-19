@@ -9,6 +9,11 @@ import {
   peekMultisigApprovalSigner,
   proposalNeedsMyApproval,
 } from '../lib/multisigApprove'
+import {
+  clearPendingWalletOutcome,
+  consumePendingWalletOutcomeIf,
+  writePendingWalletOutcome,
+} from '../../lib/walletOutcome'
 import { apiGetProposal } from '../lib/multisigFlow'
 import { MultisigProposalDetailScreen } from '../screens/multisig/MultisigProposalDetailScreen'
 import { MultisigProposalsScreen } from '../screens/multisig/MultisigProposalsScreen'
@@ -58,6 +63,17 @@ export function MultisigProposalsViews({
     }
   }, [activeAccount])
 
+  const loadProposalDetail = useCallback(async (id: string) => {
+    setProposalBusy(true)
+    try {
+      const detail = await apiGetProposal(id)
+      setActiveProposal(detail)
+      setActiveProposalId(id)
+    } finally {
+      setProposalBusy(false)
+    }
+  }, [])
+
   useEffect(() => {
     if (route === 'multisigProposals' || route === 'multisigProposalDetail') {
       void loadProposals()
@@ -68,7 +84,62 @@ export function MultisigProposalsViews({
     if (route !== 'multisigProposalDetail' || !externalProposalId) return
     setProposalActionError(null)
     void loadProposalDetail(externalProposalId)
-  }, [route, externalProposalId])
+  }, [route, externalProposalId, loadProposalDetail])
+
+  useEffect(() => {
+    void (async () => {
+      const outcome = await consumePendingWalletOutcomeIf('multisigApprove')
+      if (!outcome || outcome.status === 'in_progress') return
+      const proposalId = outcome.payload?.proposalId
+      if (typeof proposalId === 'string' && proposalId) {
+        setActiveProposalId(proposalId)
+        onSetRoute('multisigProposalDetail')
+        void loadProposalDetail(proposalId)
+      }
+      setProposalBusy(false)
+      if (outcome.status === 'failure') {
+        setProposalActionError(formatMultisigProposalError(outcome.error ?? 'Approve failed.'))
+      }
+    })()
+  }, [loadProposalDetail, onSetRoute])
+
+  async function runApprove() {
+    if (!activeProposal || !activeAccount) return
+
+    setProposalBusy(true)
+    setProposalActionError(null)
+    try {
+      if (surface === 'popup') {
+        await writePendingWalletOutcome({
+          kind: 'multisigApprove',
+          status: 'in_progress',
+          payload: { proposalId: activeProposal.id },
+        })
+      }
+      const updated = await approveMultisigProposal({
+        proposal: activeProposal,
+        activeAccount,
+        accounts,
+        surface,
+      })
+      setActiveProposal(updated)
+      await clearPendingWalletOutcome()
+    } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e)
+      setProposalActionError(formatMultisigProposalError(raw))
+      if (surface === 'popup') {
+        await writePendingWalletOutcome({
+          kind: 'multisigApprove',
+          status: 'failure',
+          error: raw,
+          payload: { proposalId: activeProposal.id },
+        }).catch(() => {})
+      }
+    } finally {
+      setProposalBusy(false)
+      void loadProposals()
+    }
+  }
 
   const pendingApprovalCount = useMemo(() => {
     if (!activeAccount?.multisigMemberId) return 0
@@ -89,17 +160,6 @@ export function MultisigProposalsViews({
       accounts,
     })
   }, [activeProposal, activeAccount, accounts])
-
-  async function loadProposalDetail(id: string) {
-    setProposalBusy(true)
-    try {
-      const detail = await apiGetProposal(id)
-      setActiveProposal(detail)
-      setActiveProposalId(id)
-    } finally {
-      setProposalBusy(false)
-    }
-  }
 
   if (route === 'multisigProposals') {
     return (
@@ -137,24 +197,7 @@ export function MultisigProposalsViews({
           approveBusyLabel={proposalApprovalUi?.busyLabel}
           onBack={() => onSetRoute('multisigProposals')}
           onApprove={() => {
-            if (!activeProposal || !activeAccount) return
-            setProposalBusy(true)
-            setProposalActionError(null)
-            void approveMultisigProposal({
-              proposal: activeProposal,
-              activeAccount,
-              accounts,
-              surface,
-            })
-              .then(setActiveProposal)
-              .catch((e) => {
-                const raw = e instanceof Error ? e.message : String(e)
-                setProposalActionError(formatMultisigProposalError(raw))
-              })
-              .finally(() => {
-                setProposalBusy(false)
-                void loadProposals()
-              })
+            void runApprove()
           }}
           onExecute={() => {
             if (!activeProposalId) return

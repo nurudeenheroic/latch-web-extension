@@ -2,6 +2,7 @@ export { DEFAULT_LATCH_API_URL, latchApiBaseUrl, latchMarketApiBaseUrl } from '.
 export { parseApiError } from './errors'
 export { BackendError, latchFetch, latchFetchAbsolute } from './client'
 export {
+  attachPasskeySigner,
   passkeyRegistrationBegin,
   passkeyRegistrationFinish,
   passkeyAuthenticationBegin,
@@ -10,12 +11,18 @@ export {
   webauthnFinishBody,
   latchExtensionJsonBody,
 } from './webauthn'
+export {
+  addAccountSigner,
+  confirmAddAccountSigner,
+  removeAccountSigner,
+  confirmRemoveAccountSigner,
+} from './accountSigners'
 export { getBackendAccounts, setBackendActiveAccount } from './accounts'
+export { clearLatchApiSession } from './webauthnSession'
 export {
   getFreighterSmartAccountStatus,
   createOrConnectFreighter,
   ensureFreighterSmartAccountDeployed,
-  createOrConnectPhantom,
   createOrConnectPasskey,
   ensurePasskeySmartAccountDeployed,
 } from './smartAccount'
@@ -26,7 +33,6 @@ export {
   setupSwapRules,
   buildTx,
   buildDelegatedTx,
-  submitTxPhantom,
   submitTxDelegated,
   submitTxWebauthn,
   prepareSign,

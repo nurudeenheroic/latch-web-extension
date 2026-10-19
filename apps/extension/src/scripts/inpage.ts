@@ -6,9 +6,21 @@
 import type {
   Network,
   OpenSignRequestParams,
+  Sep0043GetAddressResponse,
+  Sep0043GetNetworkResponse,
+  Sep0043SignTransactionOptions,
+  Sep0043SignTransactionResponse,
   SignTransactionRequest,
   SignTransactionResponse,
 } from '@latch/types'
+
+import {
+  buildSep0043NetworkResponse,
+  buildSepSignRequest,
+  mapNativeSignResponseToSep,
+  passphraseToNetwork,
+  toSep0043Error,
+} from './sep0043'
 
 const LATCH_PROVIDER_REQUEST = 'LATCH_PROVIDER_REQUEST'
 const LATCH_PROVIDER_RESPONSE = 'LATCH_PROVIDER_RESPONSE'
@@ -47,14 +59,55 @@ type ProviderEventMessage = {
 
 type ProviderEventHandler = (payload: ProviderEventPayload) => void
 
-async function sendToBackground<TData>(type: string, payload: unknown): Promise<TData> {
+type SendToBackgroundOptions = {
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+export async function sendToBackground<TData>(
+  method: string,
+  payload: unknown,
+  options: SendToBackgroundOptions = {}
+): Promise<TData> {
+  const timeoutMs = options.timeoutMs ?? 120_000
+  const signal = options.signal
   const messageId = Date.now() + Math.random()
 
+  if (signal?.aborted) {
+    throw new LatchProviderError('Latch request cancelled', 'cancelled')
+  }
+
   return new Promise((resolve, reject) => {
-    const timeout = window.setTimeout(() => {
+    let settled = false
+
+    const finish = (
+      result: { ok: true; data: TData } | { ok: false; error: LatchProviderError }
+    ) => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timeout)
       window.removeEventListener('message', onMessage)
-      reject(new LatchProviderError('Latch extension timeout', 'timeout'))
-    }, 120_000)
+      if (signal) signal.removeEventListener('abort', onAbort)
+      if (result.ok) {
+        resolve(result.data)
+        return
+      }
+      reject(result.error)
+    }
+
+    const timeout = window.setTimeout(() => {
+      finish({
+        ok: false,
+        error: new LatchProviderError('Latch extension timeout', 'timeout'),
+      })
+    }, timeoutMs)
+
+    function onAbort() {
+      finish({
+        ok: false,
+        error: new LatchProviderError('Latch request cancelled', 'cancelled'),
+      })
+    }
 
     function onMessage(event: MessageEvent) {
       if (event.source !== window) return
@@ -62,24 +115,26 @@ async function sendToBackground<TData>(type: string, payload: unknown): Promise<
       if (!data || data.source !== LATCH_PROVIDER_RESPONSE) return
       if (data.messageId !== messageId) return
 
-      window.clearTimeout(timeout)
-      window.removeEventListener('message', onMessage)
-
       if (data.ok) {
-        resolve(data.data as TData)
+        finish({ ok: true, data: data.data as TData })
         return
       }
-      reject(
-        new LatchProviderError(data.error?.message ?? 'Latch request failed', data.error?.code)
-      )
+      finish({
+        ok: false,
+        error: new LatchProviderError(
+          data.error?.message ?? 'Latch request failed',
+          data.error?.code
+        ),
+      })
     }
 
     window.addEventListener('message', onMessage, false)
+    if (signal) signal.addEventListener('abort', onAbort, { once: true })
     window.postMessage(
       {
         source: LATCH_PROVIDER_REQUEST,
         messageId,
-        type,
+        method,
         payload,
       },
       window.location.origin
@@ -87,20 +142,16 @@ async function sendToBackground<TData>(type: string, payload: unknown): Promise<
   })
 }
 
-async function sendToBackgroundWithTimeout<TData>(
-  type: string,
-  payload: unknown,
-  timeoutMs = 2000
-): Promise<TData> {
-  return await Promise.race([
-    sendToBackground<TData>(type, payload),
-    new Promise<TData>((_, reject) => {
-      window.setTimeout(
-        () => reject(new LatchProviderError('Latch extension timeout', 'timeout')),
-        timeoutMs
-      )
-    }),
-  ])
+async function fetchActivePublicKey(): Promise<string> {
+  const data = await sendToBackground<{ publicKey: string }>('getPublicKey', {
+    origin: window.location.origin,
+  })
+  return data.publicKey
+}
+
+async function fetchActiveNetwork(): Promise<Network> {
+  const data = await sendToBackground<{ network: Network }>('getNetwork', {})
+  return data.network
 }
 
 interface LatchProvider {
@@ -108,7 +159,14 @@ interface LatchProvider {
   getPublicKey(): Promise<string>
   getNetwork(): Promise<Network>
   signTransaction(request: SignTransactionRequest): Promise<SignTransactionResponse>
+  signTransaction(
+    xdr: string,
+    opts?: Sep0043SignTransactionOptions
+  ): Promise<Sep0043SignTransactionResponse>
+  getAddress(): Promise<Sep0043GetAddressResponse>
+  getNetworkDetails(): Promise<Sep0043GetNetworkResponse>
   openSignRequest(params: OpenSignRequestParams): Promise<void>
+  disconnect(): Promise<void>
   on(event: ProviderEventName, handler: ProviderEventHandler): void
   off(event: ProviderEventName, handler: ProviderEventHandler): void
   [LATCH_PROVIDER_MARK]?: true
@@ -141,34 +199,75 @@ function installLatch() {
     [LATCH_PROVIDER_MARK]: true,
     async isConnected() {
       try {
-        await sendToBackgroundWithTimeout('PING_EXTENSION', {})
+        await sendToBackground('ping', {}, { timeoutMs: 2_000 })
         return true
       } catch {
         return false
       }
     },
     async getPublicKey() {
-      const data = await sendToBackground<{ publicKey: string }>('DAPP_GET_PUBLIC_KEY', {
-        origin: window.location.origin,
-      })
-      return data.publicKey
+      return await fetchActivePublicKey()
     },
-    async signTransaction(request: SignTransactionRequest) {
+    async signTransaction(
+      requestOrXdr: SignTransactionRequest | string,
+      opts?: Sep0043SignTransactionOptions
+    ): Promise<SignTransactionResponse | Sep0043SignTransactionResponse> {
+      if (typeof requestOrXdr === 'string') {
+        try {
+          const networkFromPassphrase = passphraseToNetwork(opts?.networkPassphrase)
+          const network = networkFromPassphrase ?? (await fetchActiveNetwork())
+          const activeAddress = await fetchActivePublicKey()
+          const nativeRequest = buildSepSignRequest({
+            xdr: requestOrXdr,
+            opts,
+            activeAddress,
+            network,
+          })
+
+          const data = await sendToBackground<{ response: SignTransactionResponse }>(
+            'signTransaction',
+            {
+              origin: window.location.origin,
+              request: nativeRequest,
+            }
+          )
+
+          return mapNativeSignResponseToSep(data.response, nativeRequest.accountToSign)
+        } catch (err) {
+          throw toSep0043Error(err)
+        }
+      }
+
       const data = await sendToBackground<{ response: SignTransactionResponse }>(
-        'DAPP_SIGN_TRANSACTION',
+        'signTransaction',
         {
           origin: window.location.origin,
-          request,
+          request: requestOrXdr,
         }
       )
       return data.response
     },
     async getNetwork() {
-      const data = await sendToBackground<{ network: Network }>('GET_ACTIVE_NETWORK', {})
-      return data.network
+      return await fetchActiveNetwork()
+    },
+    async getAddress() {
+      try {
+        const address = await fetchActivePublicKey()
+        return { address }
+      } catch (err) {
+        throw toSep0043Error(err)
+      }
+    },
+    async getNetworkDetails() {
+      try {
+        const network = await fetchActiveNetwork()
+        return buildSep0043NetworkResponse(network)
+      } catch (err) {
+        throw toSep0043Error(err)
+      }
     },
     async openSignRequest(params: OpenSignRequestParams) {
-      await sendToBackground('DAPP_OPEN_SIGN_REQUEST', {
+      await sendToBackground('openSignRequest', {
         origin: window.location.origin,
         request: {
           network: params.network,
@@ -180,6 +279,13 @@ function installLatch() {
           submit: params.submit,
           origin: params.origin ?? window.location.origin,
         },
+      })
+    },
+    async disconnect() {
+      // Revokes this origin's allowlist entry only. Latch emits no event; the
+      // dapp clears its own session once this resolves.
+      await sendToBackground('disconnect', {
+        origin: window.location.origin,
       })
     },
     on(event, handler) {

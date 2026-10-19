@@ -119,7 +119,7 @@ export async function persistWebauthnCeremony(
   kind: WebauthnSessionKind,
   opts: { sid?: string; challenge?: string }
 ): Promise<void> {
-  const baseUrl = latchApiBaseUrl()
+  const baseUrl = await latchApiBaseUrl()
   const chromeExtensionId = chrome.runtime?.id
   if (!chromeExtensionId || (!opts.sid && !opts.challenge)) return
 
@@ -143,7 +143,7 @@ export async function persistWebauthnSessionSid(
   kind: WebauthnSessionKind,
   challenge?: string
 ): Promise<void> {
-  const baseUrl = latchApiBaseUrl()
+  const baseUrl = await latchApiBaseUrl()
   const chromeExtensionId = chrome.runtime?.id
   if (!chromeExtensionId) return
 
@@ -167,7 +167,7 @@ export async function persistWebauthnSession(
   kind: WebauthnSessionKind,
   sidFromResponse?: string
 ): Promise<void> {
-  const baseUrl = latchApiBaseUrl()
+  const baseUrl = await latchApiBaseUrl()
   const sid = sidFromResponse ?? (await readSidCookieWithRetry(baseUrl))
   if (!sid) return
   await persistWebauthnSessionSid(sid, kind)
@@ -176,7 +176,7 @@ export async function persistWebauthnSession(
 export async function getWebauthnSession(
   expectedKind: WebauthnSessionKind
 ): Promise<WebauthnSession | undefined> {
-  const baseUrl = latchApiBaseUrl()
+  const baseUrl = await latchApiBaseUrl()
   try {
     const bag = await chrome.storage.session.get(WEBAUTHN_SESSION_KEY)
     const session = bag[WEBAUTHN_SESSION_KEY] as WebauthnSession | undefined
@@ -195,10 +195,8 @@ export async function getWebauthnSession(
   return undefined
 }
 
-export async function captureSidAfterBegin(
-  baseUrl: string,
-  res: Response
-): Promise<string | undefined> {
+/** Persist `sid` from a Set-Cookie response (begin or authentication finish rotation). */
+export async function captureSid(baseUrl: string, res: Response): Promise<string | undefined> {
   let sid = extractSidFromFetchResponse(res)
   if (sid) {
     await setLatchSidCookie(baseUrl, sid)
@@ -208,10 +206,13 @@ export async function captureSidAfterBegin(
   return sid
 }
 
+/** @deprecated Prefer {@link captureSid} — same behavior. */
+export const captureSidAfterBegin = captureSid
+
 export async function webauthnSessionCookieHeader(
   expectedKind: WebauthnSessionKind
 ): Promise<Record<string, string>> {
-  const baseUrl = latchApiBaseUrl()
+  const baseUrl = await latchApiBaseUrl()
   const session = await getWebauthnSession(expectedKind)
   if (session?.sid) return { Cookie: `sid=${session.sid}` }
   const sid = await readSidCookie(baseUrl)
@@ -225,4 +226,17 @@ export async function clearWebauthnSession(): Promise<void> {
   } catch {
     // ignore
   }
+}
+
+/**
+ * Drop the Latch API session entirely (`sid` cookie + any in-flight ceremony).
+ *
+ * The API identifies callers by an anonymous `sid` cookie and mints a new user
+ * when it is absent, so a stale cookie makes a fresh install look like the
+ * previous session user and its whole account list. Call this on logout and
+ * whenever local storage holds no accounts.
+ */
+export async function clearLatchApiSession(): Promise<void> {
+  await clearWebauthnSession()
+  await clearLatchSidCookie(await latchApiBaseUrl())
 }

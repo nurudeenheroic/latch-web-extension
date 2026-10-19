@@ -59,18 +59,23 @@ export function HistoryScreen({
     >
       <HistoryHeader onBack={onBack} />
       <div className="mt-5">
-        <HistorySearchRow value={query} onChange={setQuery} onFilterClick={onRefresh} />
+        <HistorySearchRow value={query} onChange={setQuery} onRefreshClick={onRefresh} />
       </div>
       <div className="mt-4">
         <HistoryFilterChips active={filter} onChange={setFilter} />
       </div>
 
       <div className="mt-5 min-h-0 flex-1 overflow-auto pb-1 pr-1">
-        {loading ? (
+        {error && view.length > 0 ? (
+          <SectionCard className="mb-3 text-center text-sm font-bold text-red-300">
+            {error}
+          </SectionCard>
+        ) : null}
+        {loading && view.length === 0 ? (
           <SectionCard className="text-center text-sm font-bold text-muted">
             Loading transactions…
           </SectionCard>
-        ) : error ? (
+        ) : error && view.length === 0 ? (
           <SectionCard className="text-center text-sm font-bold text-red-300">{error}</SectionCard>
         ) : isEmpty ? (
           <HistoryEmptyState />
