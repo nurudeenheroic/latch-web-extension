@@ -59,14 +59,55 @@ type ProviderEventMessage = {
 
 type ProviderEventHandler = (payload: ProviderEventPayload) => void
 
-async function sendToBackground<TData>(type: string, payload: unknown): Promise<TData> {
+type SendToBackgroundOptions = {
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+export async function sendToBackground<TData>(
+  method: string,
+  payload: unknown,
+  options: SendToBackgroundOptions = {}
+): Promise<TData> {
+  const timeoutMs = options.timeoutMs ?? 120_000
+  const signal = options.signal
   const messageId = Date.now() + Math.random()
 
+  if (signal?.aborted) {
+    throw new LatchProviderError('Latch request cancelled', 'cancelled')
+  }
+
   return new Promise((resolve, reject) => {
-    const timeout = window.setTimeout(() => {
+    let settled = false
+
+    const finish = (
+      result: { ok: true; data: TData } | { ok: false; error: LatchProviderError }
+    ) => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timeout)
       window.removeEventListener('message', onMessage)
-      reject(new LatchProviderError('Latch extension timeout', 'timeout'))
-    }, 120_000)
+      if (signal) signal.removeEventListener('abort', onAbort)
+      if (result.ok) {
+        resolve(result.data)
+        return
+      }
+      reject(result.error)
+    }
+
+    const timeout = window.setTimeout(() => {
+      finish({
+        ok: false,
+        error: new LatchProviderError('Latch extension timeout', 'timeout'),
+      })
+    }, timeoutMs)
+
+    function onAbort() {
+      finish({
+        ok: false,
+        error: new LatchProviderError('Latch request cancelled', 'cancelled'),
+      })
+    }
 
     function onMessage(event: MessageEvent) {
       if (event.source !== window) return
@@ -74,24 +115,26 @@ async function sendToBackground<TData>(type: string, payload: unknown): Promise<
       if (!data || data.source !== LATCH_PROVIDER_RESPONSE) return
       if (data.messageId !== messageId) return
 
-      window.clearTimeout(timeout)
-      window.removeEventListener('message', onMessage)
-
       if (data.ok) {
-        resolve(data.data as TData)
+        finish({ ok: true, data: data.data as TData })
         return
       }
-      reject(
-        new LatchProviderError(data.error?.message ?? 'Latch request failed', data.error?.code)
-      )
+      finish({
+        ok: false,
+        error: new LatchProviderError(
+          data.error?.message ?? 'Latch request failed',
+          data.error?.code
+        ),
+      })
     }
 
     window.addEventListener('message', onMessage, false)
+    if (signal) signal.addEventListener('abort', onAbort, { once: true })
     window.postMessage(
       {
         source: LATCH_PROVIDER_REQUEST,
         messageId,
-        type,
+        method,
         payload,
       },
       window.location.origin
@@ -99,31 +142,15 @@ async function sendToBackground<TData>(type: string, payload: unknown): Promise<
   })
 }
 
-async function sendToBackgroundWithTimeout<TData>(
-  type: string,
-  payload: unknown,
-  timeoutMs = 2000
-): Promise<TData> {
-  return await Promise.race([
-    sendToBackground<TData>(type, payload),
-    new Promise<TData>((_, reject) => {
-      window.setTimeout(
-        () => reject(new LatchProviderError('Latch extension timeout', 'timeout')),
-        timeoutMs
-      )
-    }),
-  ])
-}
-
 async function fetchActivePublicKey(): Promise<string> {
-  const data = await sendToBackground<{ publicKey: string }>('DAPP_GET_PUBLIC_KEY', {
+  const data = await sendToBackground<{ publicKey: string }>('getPublicKey', {
     origin: window.location.origin,
   })
   return data.publicKey
 }
 
 async function fetchActiveNetwork(): Promise<Network> {
-  const data = await sendToBackground<{ network: Network }>('GET_ACTIVE_NETWORK', {})
+  const data = await sendToBackground<{ network: Network }>('getNetwork', {})
   return data.network
 }
 
@@ -139,6 +166,7 @@ interface LatchProvider {
   getAddress(): Promise<Sep0043GetAddressResponse>
   getNetworkDetails(): Promise<Sep0043GetNetworkResponse>
   openSignRequest(params: OpenSignRequestParams): Promise<void>
+  disconnect(): Promise<void>
   on(event: ProviderEventName, handler: ProviderEventHandler): void
   off(event: ProviderEventName, handler: ProviderEventHandler): void
   [LATCH_PROVIDER_MARK]?: true
@@ -171,7 +199,7 @@ function installLatch() {
     [LATCH_PROVIDER_MARK]: true,
     async isConnected() {
       try {
-        await sendToBackgroundWithTimeout('PING_EXTENSION', {})
+        await sendToBackground('ping', {}, { timeoutMs: 2_000 })
         return true
       } catch {
         return false
@@ -197,7 +225,7 @@ function installLatch() {
           })
 
           const data = await sendToBackground<{ response: SignTransactionResponse }>(
-            'DAPP_SIGN_TRANSACTION',
+            'signTransaction',
             {
               origin: window.location.origin,
               request: nativeRequest,
@@ -211,7 +239,7 @@ function installLatch() {
       }
 
       const data = await sendToBackground<{ response: SignTransactionResponse }>(
-        'DAPP_SIGN_TRANSACTION',
+        'signTransaction',
         {
           origin: window.location.origin,
           request: requestOrXdr,
@@ -239,7 +267,7 @@ function installLatch() {
       }
     },
     async openSignRequest(params: OpenSignRequestParams) {
-      await sendToBackground('DAPP_OPEN_SIGN_REQUEST', {
+      await sendToBackground('openSignRequest', {
         origin: window.location.origin,
         request: {
           network: params.network,
@@ -251,6 +279,13 @@ function installLatch() {
           submit: params.submit,
           origin: params.origin ?? window.location.origin,
         },
+      })
+    },
+    async disconnect() {
+      // Revokes this origin's allowlist entry only. Latch emits no event; the
+      // dapp clears its own session once this resolves.
+      await sendToBackground('disconnect', {
+        origin: window.location.origin,
       })
     },
     on(event, handler) {

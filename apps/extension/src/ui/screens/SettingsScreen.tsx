@@ -18,7 +18,8 @@ import signersIconUrl from 'url:../../../assets/home/settings-signers.svg'
 
 import { AccountInformationScreen } from './settings/AccountInformationScreen'
 import { AddressBookScreen } from './settings/AddressBookScreen'
-import { NetworkSettingsScreen } from './settings/NetworkSettingsScreen'
+import { ConfirmLogoutModal } from './settings/ConfirmLogoutModal'
+import { DeveloperModeConfirmScreen } from './settings/DeveloperModeConfirmScreen'
 import { PermissionsFlow } from './settings/PermissionsFlow'
 import { ProfileCard } from './settings/ProfileCard'
 import { SettingItem } from './settings/SettingItem'
@@ -26,8 +27,6 @@ import { SettingsSection } from './settings/SettingsSection'
 import { SettingsToggle } from './settings/SettingsToggle'
 import { ViewAccountsScreen, type ViewAccountItem } from './settings/ViewAccountsScreen'
 import { PulsingDot } from '../components/PulsingDot'
-
-import type { Network } from '@latch/types'
 
 const rowIconClass = 'h-5 w-5 object-contain'
 
@@ -37,7 +36,7 @@ type SettingsView =
   | 'viewAccounts'
   | 'addressBook'
   | 'permissions'
-  | 'network'
+  | 'developerMode'
 
 export function SettingsScreen({
   surface,
@@ -53,12 +52,15 @@ export function SettingsScreen({
   onSelectAccount,
   onAccountsChanged,
   onCreateMultisig,
+  onAddExistingMultisig,
+  onDeleteAccount,
   onOpenMultisigWallets,
+  onOpenAccountSigners,
   onOpenMultisigProposals,
   pendingMultisigProposalCount,
   networkLabel,
-  activeNetwork,
-  onChangeNetwork,
+  developerModeEnabled,
+  onDeveloperModeApplied,
   onClose,
   onLogout,
 }: {
@@ -75,30 +77,52 @@ export function SettingsScreen({
   onSelectAccount?: (accountId: string) => void
   onAccountsChanged?: () => void
   onCreateMultisig?: () => void
+  onAddExistingMultisig?: () => void
+  onDeleteAccount?: (accountId: string) => Promise<void>
   onOpenMultisigWallets?: () => void
+  onOpenAccountSigners?: () => void
   onOpenMultisigProposals?: () => void
   pendingMultisigProposalCount?: number
   networkLabel: string
-  activeNetwork: Network
-  onChangeNetwork: (network: Network) => Promise<void>
+  developerModeEnabled: boolean
+  onDeveloperModeApplied: () => void | Promise<void>
   onClose: () => void
-  onLogout: () => void
+  onLogout: () => void | Promise<void>
 }) {
   const [view, setView] = useState<SettingsView>('menu')
+  const [pendingDeveloperMode, setPendingDeveloperMode] = useState<boolean | null>(null)
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false)
+  const [logoutBusy, setLogoutBusy] = useState(false)
+  const [logoutError, setLogoutError] = useState<string | undefined>(undefined)
 
   const handleClose = () => {
     setView('menu')
     onClose()
   }
 
-  if (view === 'network') {
+  async function confirmLogout() {
+    setLogoutBusy(true)
+    setLogoutError(undefined)
+    try {
+      await onLogout()
+      setLogoutConfirmOpen(false)
+    } catch (err) {
+      setLogoutError(err instanceof Error ? err.message : 'Could not log out.')
+    } finally {
+      setLogoutBusy(false)
+    }
+  }
+
+  if (view === 'developerMode' && pendingDeveloperMode != null) {
     return (
       <div className="flex h-full w-full min-h-0 flex-col overflow-y-auto rounded-bl-lg rounded-br-lg bg-[#1c1c1c] py-6 pl-6 pr-4">
-        <NetworkSettingsScreen
-          currentNetwork={activeNetwork}
-          networkLabel={networkLabel}
-          onBack={() => setView('menu')}
-          onSelectNetwork={onChangeNetwork}
+        <DeveloperModeConfirmScreen
+          enabling={pendingDeveloperMode}
+          onBack={() => {
+            setPendingDeveloperMode(null)
+            setView('menu')
+          }}
+          onApplied={onDeveloperModeApplied}
         />
       </div>
     )
@@ -130,6 +154,11 @@ export function SettingsScreen({
           onBack={() => setView('menu')}
           onAccountsChanged={() => onAccountsChanged?.()}
           onCreateMultisig={() => onCreateMultisig?.()}
+          onAddExistingMultisig={() => onAddExistingMultisig?.()}
+          onDeleteAccount={async (accountId) => {
+            await onDeleteAccount?.(accountId)
+            onAccountsChanged?.()
+          }}
           onSave={(accountId) => {
             onSelectAccount?.(accountId)
             setView('menu')
@@ -233,10 +262,13 @@ export function SettingsScreen({
               icon={<img src={passwordIconUrl} alt="" className={rowIconClass} />}
               label="Password"
             />
-            <SettingItem
-              icon={<img src={signersIconUrl} alt="" className={rowIconClass} />}
-              label="Signers"
-            />
+            {onOpenAccountSigners ? (
+              <SettingItem
+                icon={<img src={signersIconUrl} alt="" className={rowIconClass} />}
+                label="Signers"
+                onClick={onOpenAccountSigners}
+              />
+            ) : null}
             <SettingItem
               icon={<img src={permissionsIconUrl} alt="" className={rowIconClass} />}
               label="Permissions"
@@ -247,12 +279,22 @@ export function SettingsScreen({
           <SettingsSection label="Preferences">
             <SettingItem
               icon={<img src={networkIconUrl} alt="" className={rowIconClass} />}
-              label="Network"
-              onClick={() => setView('network')}
-              rightElement={
-                <span className="mr-2 truncate text-sm text-[#fcfcfc]/opacity-60">
-                  {networkLabel}
+              label={
+                <span className="flex min-w-0 flex-col">
+                  <span>Developer mode</span>
+                  <span className="text-[#fcfcfc]/opacity-60">Testnet</span>
                 </span>
+              }
+              showChevron={false}
+              rightElement={
+                <SettingsToggle
+                  checked={developerModeEnabled}
+                  onChange={(next) => {
+                    setPendingDeveloperMode(next)
+                    setView('developerMode')
+                  }}
+                  ariaLabel="Developer mode, testnet"
+                />
               }
             />
             <SettingItem
@@ -291,10 +333,25 @@ export function SettingsScreen({
             label="Log Out"
             danger
             showChevron={false}
-            onClick={onLogout}
+            onClick={() => {
+              setLogoutError(undefined)
+              setLogoutConfirmOpen(true)
+            }}
           />
         </div>
       </div>
+
+      <ConfirmLogoutModal
+        isOpen={logoutConfirmOpen}
+        busy={logoutBusy}
+        error={logoutError}
+        onCancel={() => {
+          if (logoutBusy) return
+          setLogoutConfirmOpen(false)
+          setLogoutError(undefined)
+        }}
+        onConfirm={() => void confirmLogout()}
+      />
     </div>
   )
 }

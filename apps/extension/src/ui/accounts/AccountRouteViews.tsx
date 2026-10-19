@@ -3,6 +3,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import type {
   BackendWebauthnAuthenticationFinishResponse,
   BackendWebauthnBeginResponse,
+  BackendWebauthnRegistrationFinishRequest,
   BackendWebauthnRegistrationFinishResponse,
   ImportMnemonicAccountRequest,
   ImportMnemonicAccountResponse,
@@ -26,10 +27,10 @@ import {
   assertBeginOptionsRpIdMatchesCanonicalDomain,
   assertRegistrationCeremonyForFinish,
   enrichWebauthnRpIdHashErrorMessage,
-  nextPasskeyAccountDisplayName,
-  prepareAuthenticationOptionsForGet,
+  prepareDiscoverableAuthenticationOptions,
   prepareRegistrationOptionsForCreate,
 } from '../webauthn/passkey'
+import { reservePasskeyName } from '../webauthn/passkeyName'
 import { runWebauthnCredential } from '../webauthn/runWebauthnCredential'
 import { resolveMainRoute, type Route, type Surface } from '../routing/routes'
 
@@ -92,7 +93,13 @@ export function AccountRouteViews({
 
   /** Prefetch /begin options so Create / Continue does not await the network before credentials. */
   const passkeyPrefetchRef = useRef<
-    | { kind: 'registration'; optionsJSON: unknown; displayName: string }
+    | {
+        kind: 'registration'
+        optionsJSON: unknown
+        displayName: string
+        seq: number
+        commitSeq: () => Promise<void>
+      }
     | { kind: 'authentication'; optionsJSON: unknown }
     | null
   >(null)
@@ -123,7 +130,10 @@ export function AccountRouteViews({
     void (async () => {
       try {
         if (route === 'createPasskey') {
-          const displayName = nextPasskeyAccountDisplayName(accounts)
+          // This route has no name field, so the passkey is "Latch Wallet N".
+          const reserved = await reservePasskeyName({ fallbackAccounts: accounts })
+          if (cancelled) return
+          const displayName = reserved.displayName
           const begin = await sendToBackground<
             { displayName?: string },
             BackendWebauthnBeginResponse
@@ -138,7 +148,13 @@ export function AccountRouteViews({
             displayName
           )
           assertBeginOptionsRpIdMatchesCanonicalDomain(optionsJSON)
-          passkeyPrefetchRef.current = { kind: 'registration', optionsJSON, displayName }
+          passkeyPrefetchRef.current = {
+            kind: 'registration',
+            optionsJSON,
+            displayName,
+            seq: reserved.seq,
+            commitSeq: reserved.commit,
+          }
         } else {
           const begin = await sendToBackground<undefined, BackendWebauthnBeginResponse>({
             type: 'PASSKEY_AUTH_BEGIN',
@@ -146,7 +162,7 @@ export function AccountRouteViews({
           })
           if (cancelled) return
           if (!begin.ok) throw new Error(friendlyError(begin.error))
-          const optionsJSON = prepareAuthenticationOptionsForGet(begin.data?.options)
+          const optionsJSON = prepareDiscoverableAuthenticationOptions(begin.data?.options)
           assertBeginOptionsRpIdMatchesCanonicalDomain(optionsJSON)
           passkeyPrefetchRef.current = { kind: 'authentication', optionsJSON }
         }
@@ -221,7 +237,6 @@ export function AccountRouteViews({
 
   async function beginPasskeyRegistration() {
     onSetError(null)
-    onSetLoading('Creating passkey…')
     try {
       const pre = passkeyPrefetchRef.current
       if (!pre || pre.kind !== 'registration') {
@@ -234,16 +249,18 @@ export function AccountRouteViews({
       }
       const optionsJSON = pre.optionsJSON
       assertBeginOptionsRpIdMatchesCanonicalDomain(optionsJSON)
+
+      onSetLoading('Creating passkey…')
       const reg = (await webauthnCredential('registration', optionsJSON)) as Awaited<
         ReturnType<typeof startRegistration>
       >
       assertRegistrationCeremonyForFinish(reg)
       const res = await sendToBackground<
-        { response: unknown },
+        BackendWebauthnRegistrationFinishRequest,
         BackendWebauthnRegistrationFinishResponse & { account: StoredAccount }
       >({
         type: 'PASSKEY_REG_FINISH',
-        payload: { response: reg },
+        payload: { response: reg, displayName: pre.displayName, seq: pre.seq },
       })
       if (!res.ok) {
         const errMsg = friendlyError(res.error)
@@ -251,6 +268,8 @@ export function AccountRouteViews({
           await enrichWebauthnRpIdHashErrorMessage(errMsg, { optionsJSON, credentialResponse: reg })
         )
       }
+      // Retire the number only now that the passkey exists.
+      await pre.commitSeq()
       await onPersistSetupHasAccount(res.data!.smartAccountAddress)
       await onRefreshAccounts()
       onSetRoute('passkeyCreated')
@@ -264,7 +283,6 @@ export function AccountRouteViews({
 
   async function loginWithExistingPasskey() {
     onSetError(null)
-    onSetLoading('Logging in with passkey…')
     try {
       const pre = passkeyPrefetchRef.current
       if (!pre || pre.kind !== 'authentication') {
@@ -277,6 +295,8 @@ export function AccountRouteViews({
       }
       const optionsJSON = pre.optionsJSON
       assertBeginOptionsRpIdMatchesCanonicalDomain(optionsJSON)
+
+      onSetLoading('Logging in with passkey…')
       const assertion = (await webauthnCredential('authentication', optionsJSON)) as Awaited<
         ReturnType<typeof startAuthentication>
       >

@@ -1,5 +1,11 @@
 export {
   BackendError,
+  addAccountSigner,
+  attachPasskeySigner,
+  clearLatchApiSession,
+  confirmAddAccountSigner,
+  confirmRemoveAccountSigner,
+  removeAccountSigner,
   buildDelegatedTx,
   buildSendTx,
   buildSwapTx,

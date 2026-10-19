@@ -30,15 +30,18 @@ describe('background message routing (smoke)', () => {
   it('self-heals setupState to has_account when accounts already exist', async () => {
     vi.resetModules()
     await chrome.storage.local.set({
-      'latch.accounts': [
-        {
-          id: 'acct-1',
-          mode: 'passkey',
-          smartAccountAddress: 'GABC123',
-          createdAt: 1,
-        },
-      ],
-      'latch.activeAccountId': 'acct-1',
+      'latch.env.storageMigrated': true,
+      'latch.env.prod.accounts.byNetwork': {
+        mainnet: [
+          {
+            id: 'acct-1',
+            mode: 'passkey',
+            smartAccountAddress: 'GABC123',
+            createdAt: 1,
+          },
+        ],
+      },
+      'latch.env.prod.activeAccountId.byNetwork': { mainnet: 'acct-1' },
     })
 
     await import('./index')
@@ -48,5 +51,16 @@ describe('background message routing (smoke)', () => {
     expect(getRes.ok).toBe(true)
     expect(getRes.data.setupState).toBe('has_account')
     expect(getRes.data.accountPublicKey).toBe('GABC123')
+  })
+
+  it('CANCEL_REQUEST returns ok synchronously', async () => {
+    vi.resetModules()
+    await import('./index')
+
+    const res = await chrome.runtime.sendMessage({
+      type: 'CANCEL_REQUEST',
+      payload: { requestId: 'test-cancel-id' },
+    })
+    expect(res.ok).toBe(true)
   })
 })

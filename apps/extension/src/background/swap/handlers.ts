@@ -25,6 +25,7 @@ import {
 
 import { BackendError, buildSwapTx, prepareSign, setupSwapRules } from '../backend'
 import type { OkFn } from '../messageResponse'
+import { withCancellableWaiter } from '../requestWaiter'
 import { getActiveNetwork, networkPassphraseFor, sorobanRpcUrlFor } from '../network/config'
 import { getAccounts } from '../storage'
 import {
@@ -38,6 +39,10 @@ import { getOrCreateQuote, quoteCacheKey } from './quoteCache'
 function accountModeToSignerType(account: StoredAccount): SendSignerType {
   // 'freighter' is the backend wire value for delegated G-signer builds (mnemonic accounts).
   return account.mode === 'passkey' ? 'passkey' : 'freighter'
+}
+
+function passkeyKeyDataHex(account: StoredAccount): string | undefined {
+  return account.mode === 'passkey' ? account.passkeyKeyDataHex?.trim() || undefined : undefined
 }
 
 function aquariusBuildParams(
@@ -185,6 +190,7 @@ export async function runPrepareSwapTx(req: PrepareSwapTxRequest): Promise<Prepa
       smartAccountAddress: account.smartAccountAddress!,
       signerType,
       signerG: account.gAddress,
+      keyDataHex: passkeyKeyDataHex(account),
     })
   }
 
@@ -233,6 +239,7 @@ export async function runPrepareSwapTx(req: PrepareSwapTxRequest): Promise<Prepa
     unsignedTxXdr,
     signerType,
     signerG: account.gAddress,
+    keyDataHex: passkeyKeyDataHex(account),
     // Bundler public G used as tx source when building local Soroswap XDR.
     feePayerG: transactionSourceG,
   })
@@ -256,7 +263,7 @@ export async function tryHandleSwapMessage(
 
     case 'GET_SWAP_QUOTE': {
       const req = message.payload as GetSwapQuoteRequest
-      const data = await runGetSwapQuote(req)
+      const data = await withCancellableWaiter(req.requestId, () => runGetSwapQuote(req))
       sendResponse(ok(data))
       return true
     }

@@ -6,12 +6,23 @@ export interface PreparedSignOperation {
   details?: Record<string, string>
 }
 
+/** Wallet-decoded review of the dApp unsigned XDR (hybrid external-sign review). */
+export interface ExternalSignLocalReview {
+  operations: PreparedSignOperation[]
+  invokeContractIds: string[]
+  confirmBlocked: boolean
+  confirmBlockedReason: string | null
+  code?: 'unparsable_xdr' | 'network_mismatch' | 'account_mismatch' | 'contract_mismatch'
+}
+
 export interface PrepareSignRequest {
   network: Network
   smartAccountAddress: string
   unsignedTxXdr: string
   signerType?: SendSignerType
   signerG?: string
+  /** Signing passkey's key data; selects that passkey's context rule on backup-signer accounts. */
+  keyDataHex?: string
   /** Bundler public G when tx source is fee-payer; delegated entry synthesis only. */
   feePayerG?: string
 }
@@ -81,6 +92,7 @@ export interface RunExternalSignFlowPreparedResponse {
   origin: string
   signRequest: ExternalSignRequest
   prepared: PrepareSignResponse
+  localReview: ExternalSignLocalReview
 }
 
 /** Params for window.latch.openSignRequest (Layer 2 without chrome-extension:// redirect). */

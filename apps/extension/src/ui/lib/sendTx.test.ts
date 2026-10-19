@@ -14,6 +14,7 @@ import {
   isMissingTrustlineErrorMessage,
   isOpaqueSendBuildFailureMessage,
   isPrepareSignMissingSetupError,
+  isSwapRuleReconfigureError,
   missingTrustlineSendMessage,
   normalizeDelegatedBuildFields,
   resolvePasskeyAuthEntryXdr,
@@ -61,6 +62,26 @@ describe('buildSendRequestFromDraft', () => {
       contractId: baseDraft.token!.sacContractId,
     })
     expect(req?.signerG).toBeUndefined()
+  })
+
+  it('sends the signing passkey keyDataHex for passkey accounts only', () => {
+    const passkeyAccount: StoredAccount = {
+      id: 'pk1',
+      mode: 'passkey',
+      smartAccountAddress: multisigAccount.smartAccountAddress,
+      passkeyCredentialId: 'cred-b',
+      passkeyKeyDataHex: ' bbcc ',
+      createdAt: 0,
+    }
+    expect(buildSendRequestFromDraft(baseDraft, passkeyAccount, null)?.keyDataHex).toBe('bbcc')
+    expect(buildSendRequestFromDraft(baseDraft, multisigAccount, null)?.keyDataHex).toBeUndefined()
+    expect(
+      buildSendRequestFromDraft(
+        baseDraft,
+        { ...passkeyAccount, mode: 'mnemonic', gAddress: 'GSEED' },
+        null
+      )?.keyDataHex
+    ).toBeUndefined()
   })
 
   it('maps XLM portfolio rows without assetId to native', () => {
@@ -240,6 +261,12 @@ describe('isPrepareSignMissingSetupError', () => {
     expect(isPrepareSignMissingSetupError({ status: 400, code: 'invalid_network' })).toBe(false)
     expect(isPrepareSignMissingSetupError({ status: 500, code: 'internal_error' })).toBe(false)
   })
+
+  it('does not retry setup when this passkey is not a signer', () => {
+    expect(isPrepareSignMissingSetupError({ status: 409, code: 'signer_rule_not_found' })).toBe(
+      false
+    )
+  })
 })
 
 describe('isBuildSendMissingSetupError', () => {
@@ -260,6 +287,11 @@ describe('isBuildSendMissingSetupError', () => {
   it('ignores unrelated errors', () => {
     expect(isBuildSendMissingSetupError({ status: 400, code: 'invalid_network' })).toBe(false)
     expect(isBuildSendMissingSetupError({ status: 500, code: 'internal_error' })).toBe(false)
+  })
+
+  it('does not retry setup when this passkey is not a signer', () => {
+    expect(isBuildSendMissingSetupError({ status: 409, code: 'signer_rule_not_found' })).toBe(false)
+    expect(isSwapRuleReconfigureError({ status: 409, code: 'signer_rule_not_found' })).toBe(false)
   })
 })
 

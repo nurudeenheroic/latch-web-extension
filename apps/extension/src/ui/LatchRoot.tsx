@@ -2,7 +2,12 @@ import '../style.css'
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import type { GetSetupStateResponse, MultisigProposal, SetActiveAccountRequest } from '@latch/types'
+import type {
+  DeleteAccountRequest,
+  DeleteAccountResponse,
+  MultisigProposal,
+  SetActiveAccountRequest,
+} from '@latch/types'
 
 import { HistoryScreen } from './screens/history/HistoryScreen'
 import { HomeScreen } from './screens/HomeScreen'
@@ -33,11 +38,12 @@ import { ReceiveFlow } from './screens/receive/ReceiveFlow'
 import { FundScreen } from './screens/fund/FundScreen'
 import { buildTransactionDetail } from './lib/historyFormat'
 import type { TransactionDetailVm } from './types/transaction-detail'
-import { friendlyError, sendToBackground } from './lib/backgroundClient'
-import { openSidePanel, setDefaultSurface } from './lib/uiSurface'
+import { friendlyError, logLatchError, sendToBackground } from './lib/backgroundClient'
+import { closeWalletSurface, openSidePanel, setDefaultSurface } from './lib/uiSurface'
 import {
   MULTISIG_ROUTES,
   ROUTES_GATED_BY_MNEMONIC_UNLOCK,
+  SIGNER_ROUTES,
   resolveMainRoute,
   routeKeepsUiMountedForWebauthn,
   type Page,
@@ -48,10 +54,12 @@ import { useTheme } from './hooks/useTheme'
 import { useUiSurfacePreference } from './hooks/useUiSurfacePreference'
 import { useAccountsHydration } from './hooks/useAccountsHydration'
 import { usePortfolioAndHistory } from './hooks/usePortfolioAndHistory'
+import { AccountSignersRouteViews } from './signers/AccountSignersRouteViews'
 import { SwapRouteViews, type SwapOverlayFlags } from './swap/SwapRouteViews'
 import { SendRouteViews } from './send/SendRouteViews'
 import { AccountRouteViews } from './accounts/AccountRouteViews'
 import { DappRouteViews } from './dapp/DappRouteViews'
+import { readPendingWalletOutcome } from '../lib/walletOutcome'
 
 export function LatchRoot({ surface }: { surface: Surface }) {
   useTheme()
@@ -65,24 +73,40 @@ export function LatchRoot({ surface }: { surface: Surface }) {
   const [loading, setLoading] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // A popup reopened after a background confirm job lands on its result screen.
+  useEffect(() => {
+    if (surface !== 'popup') return
+    void (async () => {
+      const pending = await readPendingWalletOutcome()
+      if (!pending || pending.status === 'in_progress') return
+      if (pending.kind === 'swap') setRoute('swapConfirm')
+      else if (pending.kind === 'send') setRoute('send')
+      else if (pending.kind === 'dapp') setRoute('dappApproval')
+      else if (pending.kind === 'multisigApprove') setRoute('multisigProposalDetail')
+      else if (pending.kind === 'accountSigners') setRoute('accountSigners')
+    })()
+  }, [surface])
+
   const {
     setupState,
-    setSetupState,
     accountsHydrated,
     accountsLoadSucceeded,
+    accountsLoadError,
+    retryLoadAccounts,
     onboardingTabOpenedRef,
     accounts,
     activeAccountId,
     setActiveAccountId,
     activeNetwork,
-    setActiveNetwork,
     networkLabel,
-    setNetworkLabel,
+    developerMode,
+    refreshDeployment,
     activeAccount,
     activeAccountLabel,
     needsMnemonicUnlock,
     persistSetupHasAccount,
     refreshAccounts,
+    applyAccountsSnapshot,
   } = useAccountsHydration({ route, setRoute })
 
   const {
@@ -146,9 +170,12 @@ export function LatchRoot({ surface }: { surface: Surface }) {
   }, [route, activeAccount?.id])
 
   useEffect(() => {
+    // Missed dismiss list is non-critical — banner may reappear until next successful read.
     void apiGetMultisigProposalsBannerDismissed()
       .then(setMultisigBannerDismissedIds)
-      .catch(() => {})
+      .catch((e) => {
+        logLatchError('multisig:banner-dismissed', e)
+      })
   }, [])
 
   const loadMultisigProposals = useCallback(async () => {
@@ -206,6 +233,20 @@ export function LatchRoot({ surface }: { surface: Surface }) {
     route !== 'joinMultisig' &&
     !loading
 
+  /** Open full-tab onboarding, then dismiss this popup/side panel so the stub setup screen never sticks. */
+  async function exitToOnboardingTab() {
+    clearDappPendingRef.current()
+    setPage('main')
+    setRoute('home')
+    onboardingTabOpenedRef.current = true
+    try {
+      await openOnboardingTab()
+    } catch {
+      // Tab open is best-effort; still try to close this surface.
+    }
+    await closeWalletSurface(surface)
+  }
+
   async function logout() {
     setError(null)
     setLoading('Logging out…')
@@ -215,28 +256,47 @@ export function LatchRoot({ surface }: { surface: Surface }) {
         payload: undefined,
       })
       if (!res.ok) throw new Error(friendlyError(res.error))
-      const refreshed = await refreshAccounts()
-      clearDappPendingRef.current()
-      setPage('main')
-      if ((refreshed?.accounts.length ?? 0) > 0) {
-        setRoute(resolveMainRoute({ needsMnemonicUnlock: refreshed?.needsMnemonicUnlock ?? false }))
-      } else {
-        onboardingTabOpenedRef.current = false
-        void openOnboardingTab().catch(() => {})
-      }
+      applyAccountsSnapshot({ accounts: [], activeAccountId: undefined })
+      setLoading(null)
+      await exitToOnboardingTab()
     } finally {
       setLoading(null)
     }
   }
 
+  /** Removes the account from this install only; the wallet stays on-chain. */
+  async function deleteAccount(accountId: string) {
+    const res = await sendToBackground<DeleteAccountRequest, DeleteAccountResponse>({
+      type: 'DELETE_ACCOUNT',
+      payload: { accountId },
+    })
+    if (!res.ok || !res.data) throw new Error(friendlyError(res.error))
+    // Apply the delete payload immediately so View Accounts drops the row without
+    // waiting on a follow-up GET (mnemonic unlock flags refreshed below when needed).
+    applyAccountsSnapshot({
+      accounts: res.data.accounts,
+      activeAccountId: res.data.activeAccountId,
+    })
+    if (res.data.removedLastAccount || res.data.accounts.length === 0) {
+      await exitToOnboardingTab()
+      return
+    }
+    // Refresh mnemonic vault / signer flags for the new active account when needed.
+    await refreshAccounts()
+  }
+
   const containerClass =
-    surface === 'sidepanel' ? 'h-screen w-full min-w-[320px]' : 'h-[600px] w-[360px]'
+    surface === 'sidepanel'
+      ? 'h-screen w-full min-w-[320px] overflow-x-hidden'
+      : 'mx-auto h-[600px] w-[360px] overflow-hidden'
   const flowHeightClass = surface === 'sidepanel' ? 'flex-1 min-h-0' : 'h-[520px]'
   const showTopHeader = page === 'main' && !needsMnemonicUnlock && route === 'migration'
   // Home shell waits on portfolio only. History (Horizon + SAC) can be slow; gating
   // the whole home UI on it left a stuck "Loading..." overlay after the heavier fetch.
   const showAccountsHydrateOverlay =
-    !loading && (!accountsHydrated || (!accountsLoadSucceeded && accounts.length === 0))
+    !loading &&
+    !accountsLoadError &&
+    (!accountsHydrated || (!accountsLoadSucceeded && accounts.length === 0))
   const showHomeLoadingOverlay =
     !showAccountsHydrateOverlay &&
     (page === 'main' || page === 'settings') &&
@@ -261,6 +321,7 @@ export function LatchRoot({ surface }: { surface: Surface }) {
 
   const multisigRoutes = MULTISIG_ROUTES
   const isMultisigRoute = multisigRoutes.includes(route as Route)
+  const isSignerRoute = SIGNER_ROUTES.includes(route as Route)
 
   const mainTabRoutes = ['home', 'swap', 'history', 'explore'] as const
   const showMainBottomNav =
@@ -274,6 +335,14 @@ export function LatchRoot({ surface }: { surface: Surface }) {
           ? 'explore'
           : 'home'
 
+  const showDeveloperBanner =
+    developerMode &&
+    (page === 'settings' ||
+      route === 'home' ||
+      route === 'send' ||
+      route === 'swap' ||
+      route === 'history')
+
   return (
     <div className={['relative bg-bg text-fg', containerClass].join(' ')}>
       <div
@@ -283,6 +352,11 @@ export function LatchRoot({ surface }: { surface: Surface }) {
           showMainBottomNav ? 'pb-0' : 'pb-6',
         ].join(' ')}
       >
+        {showDeveloperBanner ? (
+          <p className="relative z-[60] -mx-6 mb-2 bg-[#222121] px-6 py-2 text-center text-sm text-[#FFAD00]">
+            Developer mode — testnet, funds have no value
+          </p>
+        ) : null}
         {showTopHeader ? (
           <div className="flex items-center justify-between gap-2">
             <AccountMenu
@@ -304,7 +378,10 @@ export function LatchRoot({ surface }: { surface: Surface }) {
                       })
                     )
                   })
-                  .catch(() => {})
+                  .catch((e) => {
+                    logLatchError('account:switch', e)
+                    setError('Could not switch account.')
+                  })
               }}
               onAddAccount={() => setRoute('addAccount')}
               onRenameAccount={(accountId) => {
@@ -367,7 +444,10 @@ export function LatchRoot({ surface }: { surface: Surface }) {
                 flowHeightClass={flowHeightClass}
                 onOpenSetupTab={() => {
                   onboardingTabOpenedRef.current = true
-                  void openOnboardingTab().catch(() => {})
+                  // Setup screen is already visible; tab open is best-effort.
+                  void openOnboardingTab().catch((e) => {
+                    logLatchError('onboarding:open-tab', e)
+                  })
                 }}
               />
             ) : null}
@@ -396,8 +476,29 @@ export function LatchRoot({ surface }: { surface: Surface }) {
                     void sendToBackground<SetActiveAccountRequest, undefined>({
                       type: 'SET_ACTIVE_ACCOUNT',
                       payload: { accountId: id },
-                    }).catch(() => {})
+                    }).catch((e) => {
+                      logLatchError('account:set-active', e)
+                      setError('Could not switch account.')
+                    })
                   }}
+                />
+              </div>
+            ) : null}
+
+            {!loading && !showOnboardingTabPrompt && isSignerRoute ? (
+              <div
+                className={[
+                  routeContentMarginClass,
+                  'flex min-h-0 flex-1 flex-col animate-screenIn',
+                  flowHeightClass,
+                ].join(' ')}
+              >
+                <AccountSignersRouteViews
+                  route={route}
+                  surface={surface}
+                  activeAccount={activeAccount}
+                  accounts={accounts}
+                  onSetRoute={(r) => setRoute(r as Route)}
                 />
               </div>
             ) : null}
@@ -482,7 +583,10 @@ export function LatchRoot({ surface }: { surface: Surface }) {
                           const next = enabled ? 'sidepanel' : 'popup'
                           setPref(next)
                           void setDefaultSurface(next).then(() => {
-                            if (next === 'sidepanel') void openSidePanel().catch(() => {})
+                            if (next === 'sidepanel')
+                              void openSidePanel().catch((e) => {
+                                logLatchError('ui:open-sidepanel', e)
+                              })
                           })
                         }}
                         onSaveAccountName={(walletName) => {
@@ -495,7 +599,10 @@ export function LatchRoot({ surface }: { surface: Surface }) {
                             },
                           })
                             .then(() => refreshAccounts())
-                            .catch(() => {})
+                            .catch((e) => {
+                              logLatchError('account:rename', e)
+                              setError('Could not rename account.')
+                            })
                         }}
                         onSelectAccount={(accountId) => {
                           void sendToBackground<SetActiveAccountRequest, undefined>({
@@ -503,19 +610,38 @@ export function LatchRoot({ surface }: { surface: Surface }) {
                             payload: { accountId },
                           })
                             .then(() => refreshAccounts())
-                            .catch(() => {})
+                            .catch((e) => {
+                              logLatchError('account:switch', e)
+                              setError('Could not switch account.')
+                            })
                         }}
                         onAccountsChanged={() => {
-                          void refreshAccounts().catch(() => {})
+                          void refreshAccounts().catch((e) => {
+                            logLatchError('account:refresh', e)
+                            setError('Could not refresh accounts.')
+                          })
                         }}
                         onCreateMultisig={() => {
                           setPage('main')
                           setRoute('createMultisig')
                         }}
+                        onAddExistingMultisig={() => {
+                          setPage('main')
+                          setRoute('addExistingMultisig')
+                        }}
+                        onDeleteAccount={deleteAccount}
                         onOpenMultisigWallets={() => {
                           setPage('main')
                           setRoute('multisigWallets')
                         }}
+                        onOpenAccountSigners={
+                          activeAccount?.mode === 'passkey'
+                            ? () => {
+                                setPage('main')
+                                setRoute('accountSigners')
+                              }
+                            : undefined
+                        }
                         onOpenMultisigProposals={
                           activeAccount?.mode === 'multisig'
                             ? () => {
@@ -528,40 +654,17 @@ export function LatchRoot({ surface }: { surface: Surface }) {
                           activeAccount?.mode === 'multisig' ? multisigPendingCount : 0
                         }
                         networkLabel={networkLabel}
-                        activeNetwork={activeNetwork}
-                        onChangeNetwork={async (network) => {
-                          const res = await sendToBackground<
-                            { network: 'testnet' | 'mainnet' },
-                            { network: 'testnet' | 'mainnet'; networkLabel: string }
-                          >({
-                            type: 'SET_ACTIVE_NETWORK',
-                            payload: { network },
-                          })
-                          if (!res.ok || !res.data) {
-                            throw new Error(res.error?.message ?? 'Failed to switch network')
+                        developerModeEnabled={developerMode}
+                        onDeveloperModeApplied={async () => {
+                          try {
+                            await refreshDeployment()
+                            await refreshAccounts()
+                          } catch (e) {
+                            logLatchError('developer-mode:refresh', e)
                           }
-                          setActiveNetwork(res.data.network)
-                          setNetworkLabel(
-                            res.data.networkLabel ||
-                              (res.data.network === 'mainnet'
-                                ? 'Stellar Mainnet'
-                                : 'Stellar Testnet')
-                          )
-                          const setupRes = await sendToBackground<undefined, GetSetupStateResponse>(
-                            {
-                              type: 'GET_SETUP_STATE',
-                              payload: undefined,
-                            }
-                          )
-                          if (setupRes.ok && setupRes.data) setSetupState(setupRes.data.setupState)
-                          await refreshAccounts()
                         }}
                         onClose={() => setPage('main')}
-                        onLogout={() =>
-                          void logout().catch((e) =>
-                            setError(e instanceof Error ? e.message : String(e))
-                          )
-                        }
+                        onLogout={logout}
                       />
                     </div>
                   </>
@@ -749,7 +852,10 @@ export function LatchRoot({ surface }: { surface: Surface }) {
               })
                 .then(() => refreshAccounts())
                 .then(() => setRenameAccountId(null))
-                .catch(() => {})
+                .catch((e) => {
+                  logLatchError('account:rename', e)
+                  setError('Could not rename account.')
+                })
             }}
           />
         ) : null}
@@ -762,6 +868,19 @@ export function LatchRoot({ surface }: { surface: Surface }) {
       {showAccountsHydrateOverlay ? (
         <div className="absolute inset-0 z-40">
           <HomeLoadingOverlay />
+        </div>
+      ) : null}
+
+      {accountsLoadError && accounts.length === 0 ? (
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-4 bg-[#121212]/90 px-8 text-center">
+          <p className="text-[16px] font-semibold text-[#fbfbfb]">{accountsLoadError}</p>
+          <button
+            type="button"
+            className="flex h-12 items-center justify-center rounded-full bg-[#FFAD00] px-6 text-[15px] font-bold text-black"
+            onClick={() => void retryLoadAccounts()}
+          >
+            Try again
+          </button>
         </div>
       ) : null}
 

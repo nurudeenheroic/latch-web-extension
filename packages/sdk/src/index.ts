@@ -20,6 +20,8 @@ import type {
   SignTransactionResponse,
 } from '@latch/types'
 
+import type { LatchPublicMethod } from './publicSurface'
+
 export type LatchAccountChangedPayload = {
   publicKey: string
   network: Network
@@ -50,6 +52,13 @@ export interface LatchSDK {
   getAddress(): Promise<Sep0043GetAddressResponse>
   getNetworkDetails(): Promise<Sep0043GetNetworkResponse>
 
+  /**
+   * Revoke Latch access for the current origin. The next `getPublicKey()` /
+   * `getAddress()` prompts the user again. Accounts and other origins are
+   * untouched, and Latch emits no event — clear your own session state.
+   */
+  disconnect(): Promise<void>
+
   /** Subscribe to active account / network changes */
   on?(event: LatchProviderEventName, handler: (payload: LatchAccountChangedPayload) => void): void
 
@@ -69,6 +78,7 @@ declare global {
       getNetwork(): Promise<Network>
       getAddress(): Promise<Sep0043GetAddressResponse>
       getNetworkDetails(): Promise<Sep0043GetNetworkResponse>
+      disconnect?(): Promise<void>
       on?(
         event: LatchProviderEventName,
         handler: (payload: LatchAccountChangedPayload) => void
@@ -121,6 +131,12 @@ export function getLatchSDK(): LatchSDK {
     async getNetworkDetails() {
       return await requireLatch().getNetworkDetails()
     },
+    async disconnect() {
+      const latch = requireLatch()
+      // Older extension builds have no disconnect; treat teardown as a no-op.
+      if (!latch.disconnect) return
+      await latch.disconnect()
+    },
     on(event, handler) {
       requireLatch().on?.(event, handler)
     },
@@ -132,6 +148,19 @@ export function getLatchSDK(): LatchSDK {
 
 export default getLatchSDK
 
+/** Compile-time: LatchSDK / Window['latch'] keys must equal LATCH_PUBLIC_METHODS. */
+type ExpectEqual<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false
+
+const _assertPublicSurface: {
+  sdk: ExpectEqual<keyof LatchSDK, LatchPublicMethod>
+  windowLatch: ExpectEqual<keyof NonNullable<Window['latch']>, LatchPublicMethod>
+} = { sdk: true, windowLatch: true }
+void _assertPublicSurface
+
+export { LATCH_PUBLIC_METHODS } from './publicSurface'
+export type { LatchPublicMethod } from './publicSurface'
+
 export {
   LatchModule,
   LATCH_MODULE_ICON,
@@ -141,6 +170,7 @@ export {
 export type { StellarWalletsKitModule, WalletKitNetworkOptions } from './stellar-wallets-kit'
 
 export type {
+  OpenSignRequestParams,
   Sep0043GetAddressResponse,
   Sep0043GetNetworkResponse,
   Sep0043SignTransactionOptions,

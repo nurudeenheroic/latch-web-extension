@@ -1,4 +1,6 @@
 import type {
+  AttachPasskeySignerRequest,
+  AttachPasskeySignerResponse,
   BackendWebauthnAuthenticationFinishRequest,
   BackendWebauthnAuthenticationFinishResponse,
   BackendWebauthnBeginResponse,
@@ -10,7 +12,7 @@ import { latchApiBaseUrl } from './config'
 import { latchFetchAbsoluteWithResponse } from './client'
 import { normalizeWebauthnCredentialForApi } from './webauthnCredential'
 import {
-  captureSidAfterBegin,
+  captureSid,
   clearWebauthnSession,
   persistWebauthnCeremony,
   webauthnSessionCookieHeader,
@@ -87,7 +89,7 @@ async function passkeyBegin(
   kind: 'registration' | 'authentication',
   extra: Record<string, unknown> = {}
 ): Promise<BackendWebauthnBeginResponse> {
-  const baseUrl = latchApiBaseUrl()
+  const baseUrl = await latchApiBaseUrl()
   const { res, data } = await latchFetchAbsoluteWithResponse<BackendWebauthnBeginResponse>(
     `${baseUrl}${path}`,
     {
@@ -96,7 +98,7 @@ async function passkeyBegin(
       headers: chromeExtensionHeaders(),
     }
   )
-  const sid = await captureSidAfterBegin(baseUrl, res)
+  const sid = await captureSid(baseUrl, res)
   await persistWebauthnCeremony(kind, {
     sid,
     challenge: challengeFromBeginOptions(data?.options),
@@ -109,17 +111,23 @@ async function passkeyFinish<TRes>(
   kind: 'registration' | 'authentication',
   req: object
 ): Promise<TRes> {
-  const baseUrl = latchApiBaseUrl()
+  const baseUrl = await latchApiBaseUrl()
   const cookieHeaders = await webauthnSessionCookieHeader(kind)
   try {
-    const { data } = await latchFetchAbsoluteWithResponse<TRes>(`${baseUrl}${path}`, {
+    const { res, data } = await latchFetchAbsoluteWithResponse<TRes>(`${baseUrl}${path}`, {
       method: 'POST',
+      // Mainnet registration finish deploys the account. Render can take longer than the default 20s.
+      timeoutMs: 90_000,
       body: await webauthnFinishBody(req, kind),
       headers: {
         ...chromeExtensionHeaders(),
         ...cookieHeaders,
       },
     })
+    // authentication/finish may rotate sid onto the passkey owner; persist immediately.
+    if (kind === 'authentication') {
+      await captureSid(baseUrl, res)
+    }
     return data
   } finally {
     await clearWebauthnSession()
@@ -141,6 +149,27 @@ export async function passkeyRegistrationFinish(
 ): Promise<BackendWebauthnRegistrationFinishResponse> {
   return passkeyFinish<BackendWebauthnRegistrationFinishResponse>(
     '/api/webauthn/registration/finish',
+    'registration',
+    req
+  )
+}
+
+/**
+ * Attach a freshly registered passkey to an existing smart account as a backup
+ * signer. Same ceremony verification as registration finish, but the API never
+ * deploys here: a deploy would derive a salt from this credential's own key
+ * data and hand the user a second wallet instead of a second signer.
+ *
+ * The signer is not authorized until `add_signer` lands on-chain.
+ */
+export async function attachPasskeySigner(
+  smartAccountAddress: string,
+  req: AttachPasskeySignerRequest
+): Promise<AttachPasskeySignerResponse> {
+  const address = smartAccountAddress.trim()
+  if (!address) throw new Error('Missing smart account address for passkey attach.')
+  return passkeyFinish<AttachPasskeySignerResponse>(
+    `/api/accounts/${encodeURIComponent(address)}/signers/passkey/register`,
     'registration',
     req
   )

@@ -1,9 +1,9 @@
 import type { BackgroundMessage } from '@latch/types'
 
-import { broadcastActiveAccountChanged, broadcastNetworkChanged } from '../dappProviderEvents'
 import type { OkFn } from '../messageResponse'
-import { getNetworkConfig, networkLabelFor, setActiveNetwork } from './config'
-import { clearNetworkScopedMemoryCaches } from './clearCaches'
+import { applyDeveloperMode } from '../api/developerMode'
+import { getDeveloperMode } from '../storage'
+import { getNetworkConfig } from './config'
 
 /** Returns true if the message type was handled. */
 export async function tryHandleNetworkMessage(
@@ -23,13 +23,15 @@ export async function tryHandleNetworkMessage(
       return true
     }
 
-    case 'SET_ACTIVE_NETWORK': {
-      const req = message.payload as { network: 'testnet' | 'mainnet' }
-      const network = await setActiveNetwork(req.network)
-      clearNetworkScopedMemoryCaches()
-      await broadcastNetworkChanged(network)
-      await broadcastActiveAccountChanged()
-      sendResponse(ok({ network, networkLabel: networkLabelFor(network) }))
+    case 'GET_DEVELOPER_MODE': {
+      sendResponse(ok({ enabled: await getDeveloperMode() }))
+      return true
+    }
+
+    case 'SET_DEVELOPER_MODE': {
+      const req = message.payload as { enabled: boolean }
+      await applyDeveloperMode(req.enabled === true)
+      sendResponse(ok({ enabled: req.enabled === true }))
       return true
     }
 
